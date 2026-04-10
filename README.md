@@ -12,5 +12,11 @@ What to do: Evaluate Hugging Face's smolVLA as a lightweight Vision‑Language�
 7) Analyze where smolVLA fails compared to larger models and identify task complexity thresholds
 
 Software needed: Hugging Face Transformers, smolVLA, OpenVLA, PyTorch, Gazebo or SIMPLER env, ROS2 Humble, Python profiling tools (torch.profiler, nvidia‑smi)
+
 Research needed: VLA model architectures (openpi, OpenVLA, smolVLA), embodied AI benchmarks, model compression and edge deployment, vision‑language grounding, action tokenization methods
+
 Deliverables: smolVLA evaluation pipeline, benchmark results across all tasks and models, resource consumption analysis, recommendation report on edge deployment viability, identification of failure modes and task complexity limits
+
+# Starting point
+- https://github.com/Genesis-Embodied-AI/Genesis could be as we told the simulation environment
+- https://github.com/huggingface/lerobot/blob/main/docs/source/smolvla.mdx
