@@ -2,6 +2,7 @@ import os
 import numpy as np
 import genesis as gs
 import torch
+from oracle import SO101Oracle, OracleConfig, collect_demonstrations
 
 
 
@@ -130,7 +131,8 @@ def check_sub_goals(so101, cube, target_zone, table_height, min_height, radius):
     near_block   = gripper_dist < 0.05
 
     #? Sub-goal 2: block lifted > 2 cm off table
-    lifted = cube_pos[2].item() > (table_height + 0.02)
+    is_elevated = cube_pos[2].item() > (table_height + 0.02)
+    lifted = bool(is_elevated and near_block)       # to avoid tumbling being counted as lifting
 
     #? Sub-goal 3: block placed at target (Pass the missing variables here)
     placed = is_sucess(cube, target_zone, min_height, table_height, radius)
@@ -146,6 +148,7 @@ def check_sub_goals(so101, cube, target_zone, table_height, min_height, radius):
         "placed":     placed,
         "Sum":        partial_sum,
     }
+
 
 
 def main():
@@ -178,6 +181,15 @@ def main():
     min_height = 0.005      # if more than it is not considered resting but lifted
     cube, target_zone = build_environment(scene, table_height)
     
+    # 1. Define wrapper callbacks that inject the missing threshold variables
+    def oracle_success_wrapper(c, tz, th):
+        return is_sucess(c, tz, min_height, th, radius)
+
+    def oracle_sub_goals_wrapper(robot, c, tz, th):
+        return check_sub_goals(robot, c, tz, th, min_height, radius)
+
+
+
     # ? The robot
     so101 = scene.add_entity(
         gs.morphs.MJCF(
@@ -191,6 +203,21 @@ def main():
 
     # build the scene
     scene.build()
+
+    records = collect_demonstrations(
+        so101        = so101,
+        scene        = scene,
+        cameras      = cameras,
+        cube         = cube,
+        target_zone  = target_zone,
+        table_height = table_height,
+        is_success_fn      = oracle_success_wrapper,        # your function
+        check_sub_goals_fn = oracle_sub_goals_wrapper,   # your function
+        n_episodes   = 150,
+        output_dir   = "demos/baseline/",
+    )
+    
+
     n_dofs = so101.n_dofs
 
     n_episodes = 2
