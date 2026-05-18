@@ -115,9 +115,9 @@ def reset_episode(scene, so101, cube, table_height, home_dofs=None):
     return home_dofs
 
 # * To get a better understanding in the case of failure
-def check_sub_goals(so101, cube, target_zone, table_height):
+def check_sub_goals(so101, cube, target_zone, table_height, min_height, radius):
     """
-    Returns a dict of sub-goal completions and a weighted PSS score.
+    Returns a dict of sub-goal completions and a weighted score.
     Weights per plan: gripper-near-block=0.2, block-lifted=0.4, placed=1.0
     """
     cube_pos   = cube.get_pos()
@@ -132,8 +132,8 @@ def check_sub_goals(so101, cube, target_zone, table_height):
     #? Sub-goal 2: block lifted > 2 cm off table
     lifted = cube_pos[2].item() > (table_height + 0.02)
 
-    #? Sub-goal 3: block placed at target 
-    placed = is_sucess(cube, target_zone, table_height)
+    #? Sub-goal 3: block placed at target (Pass the missing variables here)
+    placed = is_sucess(cube, target_zone, min_height, table_height, radius)
 
     partial_sum = 0.0
     if near_block: partial_sum += 0.2
@@ -146,6 +146,7 @@ def check_sub_goals(so101, cube, target_zone, table_height):
         "placed":     placed,
         "Sum":        partial_sum,
     }
+
 
 def main():
     # path for the robot arm
@@ -213,8 +214,17 @@ def main():
 
             scene.step()
 
-            # for each step we check if it was a success
-            if is_sucess(cube, target_zone, min_height, table_height, radius):
+            # we see the status that every step causes
+            status = check_sub_goals(so101, cube, target_zone, table_height, min_height, radius)
+            
+            # update the statuses
+            max_sum = max(max_sum, status["Sum"])
+            achieved_goals["near_block"] |= status["near_block"]
+            achieved_goals["lifted"]     |= status["lifted"]
+            achieved_goals["placed"]     |= status["placed"]
+
+            # if it was a success
+            if status["placed"]:
                 print(f"Task Completed at episode {ep}, step {i}")
                 break
             
@@ -222,6 +232,9 @@ def main():
             if i % 10 == 0:
                 rgb_front, _, _, _ = cameras["front"].render()
                 rgb_top, _, _, _ = cameras["top"].render()
+                
+        # some feedback
+        print(f"Episode {ep} finished.\n Max Sum: {max_sum:.2f} \n Goals: {achieved_goals}")
 
 if __name__ == "__main__":
     main()
