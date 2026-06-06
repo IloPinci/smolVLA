@@ -20,7 +20,12 @@ def build_environment(scene,  table_height):
             size=(table_width, table_depth, surface_thickness),
             pos=(0.0, 0.0, table_height - (surface_thickness / 2.0)),
             fixed=True
-        )
+        ),
+        material=gs.materials.Rigid(
+            friction=0.01,
+            coup_friction=0.1,
+            coup_softness=0.001,
+        ),
     )
 
     #? create the legs
@@ -38,7 +43,13 @@ def build_environment(scene,  table_height):
     cube = scene.add_entity(
         gs.morphs.Box(
             size=(0.03, 0.03, 0.03),
-            pos=(0.25, 0.0, table_height + 0.015)
+            pos=(0.3, 0.0, table_height + 0.015),
+        ),
+        material=gs.materials.Rigid(
+            rho = 1000.0,        # to the block with mass
+            friction=2.0,
+            coup_friction=1.5,
+            coup_softness=0.001,
         ),
         surface=gs.surfaces.Rough(
             color=(1.0, 0.0, 0.0)       # ! Here you can change the color
@@ -50,7 +61,7 @@ def build_environment(scene,  table_height):
         gs.morphs.Cylinder(
             radius=0.05,
             height=0.001,
-            pos=(-0.15, -0.15, table_height + 0.001)
+            pos=(0.15, -0.15, table_height + 0.001)
         ),
         surface=gs.surfaces.Rough(color=(0.0, 1.0, 0.0))
     )
@@ -77,8 +88,17 @@ def attach_cameras(scene, table_height):
         fov=65,
         GUI=False
     )
+
+    #! wrist
+    cam_wrist = scene.add_camera(
+        res=(512, 512),
+        pos=(0.05, 0.0, table_height + 0.3),
+        lookat=(0.0, 0.0, table_height),
+        fov=90,
+        GUI=False
+    )
     
-    return {"front": cam_front, "top": cam_top}
+    return {"front": cam_front, "top": cam_top, "wrist": cam_wrist}
 
 # * Check if the cube has gone to the targed  
 def is_sucess(cube, target_zone, min_height, table_height, radius):
@@ -106,7 +126,7 @@ def reset_episode(scene, so101, cube, table_height, home_dofs=None):
     so101.control_dofs_position(home_dofs)              # the motors targets are updated so the robot maintains the home position
 
     # cube
-    cube.set_pos(torch.tensor([0.25, 0.0, table_height + 0.015]))   # original position
+    cube.set_pos(torch.tensor([0.3, 0.0, table_height + 0.015]))   # original position
     cube.set_quat(np.array([1.0, 0.0, 0.0, 0.0]))   # orient if tumbled
 
     # Let physics settle for 10 steps before starting the episode
@@ -150,7 +170,6 @@ def check_sub_goals(so101, cube, target_zone, table_height, min_height, radius):
     }
 
 
-
 def main():
     # path for the robot arm
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -159,6 +178,19 @@ def main():
     gs.init(backend=gs.gpu, seed=42)
 
     scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=0.01,
+            substeps=32,          # more substeps = better contact resolution
+        ),
+        rigid_options=gs.options.RigidOptions(
+            constraint_solver=gs.constraint_solver.Newton,   # more robust than CG for grasping
+            iterations=100,                                  # default is 50
+            tolerance=1e-9,
+            constraint_timeconst=0.006,   # <<< KEY: smaller = stiffer contacts, less jello/ default is 0.01; try 0.004–0.006
+            enable_self_collision=True,  # stops finger-finger collision causing clipping
+            box_box_detection=True,       # explicit box-box collision (your cube vs fingers)
+    ),
+
         #? the lighting level should be kept constants so it doesn't ruin the testing
         vis_options=gs.options.VisOptions(
             show_world_frame=True,
@@ -194,15 +226,51 @@ def main():
     so101 = scene.add_entity(
         gs.morphs.MJCF(
             file=xml_path, 
-            pos=(0.0, 0.1, table_height)
+            pos=(0.0, 0.0, table_height)
         )
     )
 
     #! Cameras
     cameras = attach_cameras(scene, table_height)
 
+    # Anchor wrist camera to gripper link
+    gripper_link = so101.get_link("gripper")
+    offset_T = np.eye(4)
+    # Translation offset (x, y, z)
+    offset_T[:3, 3] = np.array([0.0, 0.04, 0.1])
+    # To adjust camera orientation, assign a 3x3 rotation matrix to offset_T[:3, :3]
+    cameras["wrist"].attach(gripper_link, offset_T)
+
     # build the scene
     scene.build()
+
+    # ── Gripper contact friction ───────────────────────────────────────────
+    # Genesis computes contact friction as the geometric mean of both bodies.
+    # The cube has coup_friction=2.0, so each gripper surface needs >= 2.0
+    # to produce a combined value that can resist gravity during the lift.
+    for link_name in ["gripper", "moving_jaw_so101_v1"]:
+        link = so101.get_link(link_name)
+        link.set_friction(5.0)          # coulomb friction coefficient
+
+    # -- Arm joints (0-4): high stiffness for precise IK tracking
+    arm_dofs = np.arange(5)
+    so101.set_dofs_kp(np.array([4000, 4000, 3000, 2000, 2000]), dofs_idx_local=arm_dofs)
+    so101.set_dofs_kv(np.array([400,  400,  300,  200,  200]),  dofs_idx_local=arm_dofs)
+    
+    # -- Gripper (DOF 5): use force control, not position control
+    gripper_dof = np.array([5])
+    so101.set_dofs_kp(np.array([200.0]),  dofs_idx_local=gripper_dof)
+    so101.set_dofs_kv(np.array([20.0]),   dofs_idx_local=gripper_dof)
+    so101.set_dofs_force_range(
+        lower=np.array([-50.0]),
+        upper=np.array([ 50.0]),
+        dofs_idx_local=gripper_dof,
+    )
+
+    # Set friction on all gripper collision links
+    for link_name in ["gripper", "moving_jaw_so101_v1"]:
+        link = so101.get_link(link_name)
+        link.set_friction(3.0)   # match cube surface friction
 
     records = collect_demonstrations(
         so101        = so101,
@@ -241,6 +309,9 @@ def main():
 
             scene.step()
 
+            # Synchronize attached camera pose with rigid link
+            cameras["wrist"].move_to_attach()
+
             # we see the status that every step causes
             status = check_sub_goals(so101, cube, target_zone, table_height, min_height, radius)
             
@@ -259,6 +330,7 @@ def main():
             if i % 10 == 0:
                 rgb_front, _, _, _ = cameras["front"].render()
                 rgb_top, _, _, _ = cameras["top"].render()
+                rgb_wrist, _, _, _ = cameras["wrist"].render()
                 
         # some feedback
         print(f"Episode {ep} finished.\n Max Sum: {max_sum:.2f} \n Goals: {achieved_goals}")

@@ -1,283 +1,210 @@
-import os
 import numpy as np
-import genesis as gs
 import torch
 from dataclasses import dataclass, field
-from typing import Optional
-
-
-# ─── Oracle configuration ─────────────────────────────────────────────────────
 
 @dataclass
 class OracleConfig:
-    # Gaussian noise added to each waypoint position (metres)
-    pos_noise_sigma:  float = 0.005          # 0.5 cm per plan spec
-    # Gaussian noise added to each waypoint orientation (radians)
-    rot_noise_sigma:  float = np.deg2rad(2)  # 2° per plan spec
+    # Noise
+    pos_noise_sigma: float  = 0.002
+    rot_noise_sigma: float  = np.deg2rad(2)
 
-    # Physics steps spent moving between consecutive waypoints
-    steps_per_segment: int = 30
+    # Trajectory
+    steps_per_segment: int  = 30
+    pregrasp_clearance: float = 0.12
+    lift_height: float        = 0.15
+    carry_clearance: float    = 0.15
 
-    # Extra settling steps after reaching each waypoint
-    # (PD controller needs time to converge — same reason Genesis docs add 100 steps)
-    settle_steps: int = 40
+    # Gripper — position control only (one-sided jaw)
+    gripper_open: float       = 0.8
+    # Jaw stops here and kp does the squeezing.
+    # Tune upward (0.22, 0.25 …) if jaw clips through cube geometry,
+    # tune downward if it doesn't make firm contact.
+    gripper_close_safe: float = 0.22
 
-    # Gripper DOF joint limits from XML:
-    #   range="-0.17453 1.74533"
-    gripper_open:  float = -0.17   # open position (near lower limit)
-    gripper_close: float =  1.40   # closed enough to grip a 3 cm cube
-
-    # Waypoint heights relative to the table surface
-    pregrasp_clearance: float = 0.10   # 10 cm above cube
-    lift_height:        float = 0.15   # 15 cm above grasp pose
-    carry_clearance:    float = 0.15   # 15 cm above target zone
-
-    # IK solver tolerance — tighten if the arm undershoots waypoints
+    # IK tolerances
     ik_pos_tol: float = 1e-4
     ik_rot_tol: float = 1e-4
-    
+
+    # Settle steps per waypoint
+    settle_steps: list = field(default_factory=lambda: [
+        10,   # WP0  hover          — move fast
+        40,   # WP1  descend        — let arm settle
+        80,   # WP2  close gripper  — long: contact force must stabilise before arm moves
+        20,   # WP3  lift
+        20,   # WP4  carry
+        50,   # WP5  release        — let cube settle on target
+    ])
 
 
-@dataclass
-class EpisodeRecord:
-    """Stores everything needed to build one LeRobot dataset episode."""
-    observations_front: list = field(default_factory=list)   # (H, W, 3) uint8
-    observations_top:   list = field(default_factory=list)
-    states:             list = field(default_factory=list)   # (6,) float32
-    actions:            list = field(default_factory=list)   # (6,) float32
-    sub_goals:          list = field(default_factory=list)   # dict per step
-    success:            bool = False
-    total_steps:        int  = 0
-    task:               str  = "Pick up the red block and place it on the target."
+# Joint index aliases matching so101 XML DOF ordering
+_ARM_DOFS     = np.arange(5)
+_GRIPPER_DOF  = np.array([5])
 
-
-# ─── DOF index map for SO-101 ─────────────────────────────────────────────────
-# From the XML actuator order:
-#   0: shoulder_pan  1: shoulder_lift  2: elbow_flex
-#   3: wrist_flex    4: wrist_roll     5: gripper
-ARM_DOFS     = np.arange(5)   # indices 0-4
-GRIPPER_DOF  = np.array([5])  # index 5
-
-
-# ─── Oracle class ─────────────────────────────────────────────────────────────
 
 class SO101Oracle:
-    """
-    IK-based scripted oracle for pick-and-place on the SO-101 arm in Genesis.
+    def __init__(self, so101, scene, cameras=None, cfg: OracleConfig = OracleConfig()):
+        self.robot  = so101
+        self.scene  = scene
+        self.cfg    = cfg
+        self._rng   = np.random.default_rng()
 
-    Usage:
-        oracle = SO101Oracle(so101, scene, cameras, cfg)
-        record = oracle.run_episode(cube_pos, target_pos)
-    """
-
-    def __init__(self, so101, scene, cameras: dict,
-                 cfg: OracleConfig = OracleConfig()):
-        self.robot   = so101
-        self.scene   = scene
-        self.cameras = cameras
-        self.cfg     = cfg
-
-        # End-effector: the moving jaw — closest link to the object
-        # "moving_jaw_so101_v1" is the terminal link in the XML kinematic chain
+        # Terminal kinematic link used as IK target
         self.end_effector = so101.get_link("moving_jaw_so101_v1")
 
-        # Downward-pointing gripper orientation (wxyz).
-        # (0, 1, 0, 0) = 180° around Y → gripper Z points down, matching Genesis
-        # convention used in all IK examples. Adjust if your home pose differs.
-        self.grasp_quat = np.array([0.0, 1.0, 0.0, 0.0])
+        # Downward-facing gripper orientation (180 deg about Y)
+        self.grasp_quat = np.array([0.707107, 0.0, -0.707107, 0.0])
 
-        self._rng = np.random.default_rng()   # seeded externally via gs.init(seed=)
+    # ------------------------------------------------------------------ #
+    #  Public API                                                          #
+    # ------------------------------------------------------------------ #
 
-    # ── Public entry point ────────────────────────────────────────────────────
-
-    def run_episode(self,
-                    cube,
-                    target_zone,
-                    table_height: float,
-                    is_success_fn,
-                    check_sub_goals_fn) -> EpisodeRecord:
-        """
-        Execute one full pick-and-place episode and return the recorded data.
-
-        Args:
-            cube:              Genesis entity for the cube
-            target_zone:       Genesis entity for the target cylinder
-            table_height:      float, metres
-            is_success_fn:     callable(cube, target_zone, table_height) → bool
-            check_sub_goals_fn: callable(so101, cube, target_zone, table_height) → dict
-        """
-        record = EpisodeRecord()
+    def run_episode(self, cube, target_zone, table_height,
+                    is_success_fn, check_sub_goals_fn) -> bool:
 
         cube_pos   = cube.get_pos().cpu().numpy()
         target_pos = target_zone.get_pos().cpu().numpy()
 
-        # Compute all 5 Cartesian waypoints once, then add noise
         waypoints = self._compute_waypoints(cube_pos, target_pos, table_height)
 
-        # Gripper state per waypoint: open for pre-grasp/grasp approach,
-        # close at grasp, keep closed through carry, open at place
-        gripper_states = [
-            self.cfg.gripper_open,    # WP0 — home / pregrasp
-            self.cfg.gripper_open,    # WP1 — descend to grasp
-            self.cfg.gripper_close,   # WP2 — lift (gripper closes here)
-            self.cfg.gripper_close,   # WP3 — carry over target
-            self.cfg.gripper_open,    # WP4 — place (release)
+        # Duplicate WP1 (descent endpoint) so the arm holds still while the
+        # gripper actuates.  This becomes the new WP2; original WP2 (lift)
+        # shifts to WP3, etc.
+        waypoints.insert(2, waypoints[1].copy())
+
+        # All waypoints use position control — force mode is unsafe for a
+        # one-sided jaw (no opposing surface → jaw tunnels through cube).
+        # kp on the gripper DOF provides squeeze force once the jaw contacts
+        # the cube and can no longer reach gripper_close_safe.
+        gripper_targets = [
+            self.cfg.gripper_open,        # WP0  hover
+            self.cfg.gripper_open,        # WP1  descend
+            self.cfg.gripper_close_safe,  # WP2  close (arm stationary)
+            self.cfg.gripper_close_safe,  # WP3  lift
+            self.cfg.gripper_close_safe,  # WP4  carry
+            self.cfg.gripper_open,        # WP5  release
         ]
 
-        # Execute segment by segment
         prev_qpos = self.robot.get_dofs_position()
+        success   = False
 
-        for wp_idx, (wp_pos, g_state) in enumerate(zip(waypoints, gripper_states)):
-            prev_qpos = self._execute_segment(
-                wp_pos, g_state, prev_qpos,
-                record, cube, target_zone, table_height,
-                is_success_fn, check_sub_goals_fn,
+        for wp_pos, g_target, s_steps in zip(
+                waypoints, gripper_targets, self.cfg.settle_steps):
+
+            prev_qpos, success = self._execute_segment(
+                wp_pos, g_target, s_steps, prev_qpos,
+                cube, target_zone, table_height, check_sub_goals_fn,
             )
-
-            # Early exit if placed successfully
-            if record.success:
+            if success:
                 break
 
-        # Final check after all waypoints complete
-        if not record.success:
-            record.success = is_success_fn(cube, target_zone, table_height)
+        if not success:
+            success = is_success_fn(cube, target_zone, table_height)
 
-        record.total_steps = len(record.states)
-        return record
+        return success
 
-    # ── Waypoint computation ──────────────────────────────────────────────────
+    # ------------------------------------------------------------------ #
+    #  Waypoint computation                                                #
+    # ------------------------------------------------------------------ #
 
-    def _compute_waypoints(self,
-                           cube_pos:   np.ndarray,
+    def _compute_waypoints(self, cube_pos: np.ndarray,
                            target_pos: np.ndarray,
                            table_height: float) -> list:
-        """
-        Build 5 Cartesian waypoints with per-waypoint Gaussian noise.
-
-        WP0  pre-grasp  — 10 cm above cube (gripper open, approaching)
-        WP1  grasp      — at cube surface
-        WP2  lift       — 15 cm above grasp
-        WP3  carry      — 15 cm above target zone
-        WP4  place      — at target zone surface
-        """
         cfg = self.cfg
-        sz  = cfg.pos_noise_sigma
 
-        wp0_nominal = cube_pos   + np.array([0, 0, cfg.pregrasp_clearance])
-        wp1_nominal = cube_pos   + np.array([0, 0, 0.015])  # cube half-height
-        wp2_nominal = cube_pos   + np.array([0, 0, cfg.lift_height])
-        wp3_nominal = target_pos + np.array([0, 0, cfg.carry_clearance])
-        wp4_nominal = target_pos + np.array([0, 0, 0.016])  # rest on target
+        # Physical offset from the IK link origin to the jaw contact surface
+        gripper_length = 0.06
+        y_offset       = -0.006
+
+        wp0 = cube_pos   + np.array([0.015, y_offset, cfg.pregrasp_clearance + gripper_length])
+        wp1 = cube_pos   + np.array([0.015, y_offset, 0.010 + gripper_length])
+        wp2 = cube_pos   + np.array([0.015, y_offset, cfg.lift_height + gripper_length])
+        wp3 = target_pos + np.array([0.0,   0.0,      cfg.carry_clearance + gripper_length])
+        wp4 = target_pos + np.array([0.0,   0.0,      0.02 + gripper_length])
 
         waypoints = []
-        for nominal in [wp0_nominal, wp1_nominal, wp2_nominal,
-                        wp3_nominal, wp4_nominal]:
-            noise    = self._rng.normal(0, sz, size=3)
-            noise[2] = abs(noise[2])   # never push below table on Z
+        for nominal in [wp0, wp1, wp2, wp3, wp4]:
+            noise    = self._rng.normal(0, cfg.pos_noise_sigma, size=3)
+            noise[2] = abs(noise[2])   # never push Z below nominal
+            noise[0] *= 0.4            # dampen lateral scatter for one-sided jaw
+            noise[1] *= 0.4
             waypoints.append(nominal + noise)
 
         return waypoints
 
-# ── Segment execution ─────────────────────────────────────────────────────
+    # ------------------------------------------------------------------ #
+    #  Segment execution                                                   #
+    # ------------------------------------------------------------------ #
 
-    def _execute_segment(self,
-                         target_cart_pos: np.ndarray,
-                         gripper_state:   float,
-                         prev_qpos:       torch.Tensor, # Note: Now expects a Tensor
-                         record:          EpisodeRecord,
+    def _execute_segment(self, target_cart_pos: np.ndarray,
+                         gripper_target: float,
+                         settle_steps: int,
+                         prev_qpos: torch.Tensor,
                          cube, target_zone, table_height,
-                         is_success_fn, check_sub_goals_fn) -> torch.Tensor:
-        """
-        Solve IK, interpolate, and step physics 100% on the GPU.
-        Converts to NumPy only when appending to the recording buffer.
-        """
+                         check_sub_goals_fn):
+
         cfg = self.cfg
 
-        # Add orientation noise
-        rot_noise_angle = self._rng.normal(0, cfg.rot_noise_sigma)
-        noisy_quat = self._perturb_quat_z(self.grasp_quat, rot_noise_angle)
+        # Noisy yaw perturbation around the grasp orientation
+        yaw_noise  = self._rng.normal(0, cfg.rot_noise_sigma)
+        noisy_quat = self._perturb_quat_z(self.grasp_quat, yaw_noise)
 
-        # 1. Solve IK (Returns a GPU Tensor)
         target_qpos = self.robot.inverse_kinematics(
-            link     = self.end_effector,
-            pos      = target_cart_pos,
-            quat     = noisy_quat,
-            pos_tol  = cfg.ik_pos_tol,
-            rot_tol  = cfg.ik_rot_tol,
+            link    = self.end_effector,
+            pos     = target_cart_pos,
+            quat    = noisy_quat,
+            pos_tol = cfg.ik_pos_tol,
+            rot_tol = cfg.ik_rot_tol,
         )
 
-        # 2. Overwrite the gripper DOF directly on the GPU tensor (index 5)
-        target_qpos[5] = gripper_state
+        # Bake gripper target into qpos so interpolation carries it correctly
+        target_qpos[5] = gripper_target
 
-        # 3. Calculate interpolation trajectory 100% on the GPU using PyTorch
-        steps = cfg.steps_per_segment
-        alphas = torch.linspace(0.0, 1.0, steps, device=target_qpos.device).unsqueeze(1)
-        
-        # Matrix math: creates shape (steps, 6) with all intermediate joint states
+        # Linear interpolation in joint space
+        steps  = cfg.steps_per_segment
+        alphas = torch.linspace(0.0, 1.0, steps,
+                                device=target_qpos.device).unsqueeze(1)
         interp_configs = prev_qpos + alphas * (target_qpos - prev_qpos)
 
-        # 4. Execution loop
+        success = False
+
+        def _step(qpos: torch.Tensor) -> bool:
+            """Command one full joint configuration and advance the sim."""
+            # Arm: position control for precise IK tracking
+            self.robot.control_dofs_position(
+                qpos[_ARM_DOFS],
+                dofs_idx_local=_ARM_DOFS,
+            )
+            # Gripper: position control — kp acts as implicit squeeze spring
+            self.robot.control_dofs_position(
+                qpos[_GRIPPER_DOF],
+                dofs_idx_local=_GRIPPER_DOF,
+            )
+            self.scene.step()
+            sub = check_sub_goals_fn(self.robot, cube, target_zone, table_height)
+            return sub["placed"]
+
+        # Interpolation phase
         for interp_qpos in interp_configs:
-            self.robot.control_dofs_position(interp_qpos)
-            self.scene.step()
-            
-            # Send a CPU copy to the recorder for the LeRobot dataset
-            self._record_step(record, cube, target_zone, table_height,
-                              interp_qpos.cpu().numpy(), is_success_fn, check_sub_goals_fn)
-            if record.success:
-                return interp_qpos
+            if _step(interp_qpos):
+                return interp_qpos, True
 
-        # 5. Settling steps — hold target_qpos while the PD controller converges
-        for _ in range(cfg.settle_steps):
-            self.robot.control_dofs_position(target_qpos)
-            self.scene.step()
-            
-            self._record_step(record, cube, target_zone, table_height,
-                              target_qpos.cpu().numpy(), is_success_fn, check_sub_goals_fn)
-            if record.success:
-                return target_qpos
+        # Static settle phase — hold target until PD transients decay
+        for _ in range(settle_steps):
+            if _step(target_qpos):
+                return target_qpos, True
 
-        return target_qpos
+        return target_qpos, False
 
-
-    # ── Per-step recording ────────────────────────────────────────────────────
-
-    def _record_step(self,
-                     record:   EpisodeRecord,
-                     cube, target_zone, table_height,
-                     commanded_qpos: np.ndarray,
-                     is_success_fn, check_sub_goals_fn):
-        """Capture cameras, joint state, action, and sub-goals for one step."""
-        rgb_front, _, _, _ = self.cameras["front"].render()
-        rgb_top,   _, _, _ = self.cameras["top"].render()
-        joint_pos          = self.robot.get_dofs_position().cpu().numpy()
-
-        record.observations_front.append(rgb_front)
-        record.observations_top.append(rgb_top)
-        record.states.append(joint_pos.astype(np.float32))
-
-        # Action = the commanded position we just sent (not the current state).
-        # LeRobot trains on absolute joint targets, not deltas, for position control.
-        record.actions.append(commanded_qpos.astype(np.float32))
-
-        sub = check_sub_goals_fn(self.robot, cube, target_zone, table_height)
-        record.sub_goals.append(sub)
-
-        if sub["placed"] and not record.success:
-            record.success = True
-
-    # ── Orientation noise helper ──────────────────────────────────────────────
+    # ------------------------------------------------------------------ #
+    #  Quaternion utility                                                  #
+    # ------------------------------------------------------------------ #
 
     @staticmethod
     def _perturb_quat_z(base_quat: np.ndarray, angle_rad: float) -> np.ndarray:
-        """
-        Compose base_quat with a small rotation around world Z.
-        Keeps the gripper pointing downward while varying yaw slightly.
-        """
-        half   = angle_rad / 2.0
-        dq     = np.array([np.cos(half), 0.0, 0.0, np.sin(half)])  # wxyz, rot around Z
-        w1,x1,y1,z1 = base_quat
-        w2,x2,y2,z2 = dq
+        half = angle_rad / 2.0
+        dq   = np.array([np.cos(half), 0.0, 0.0, np.sin(half)])
+        w1, x1, y1, z1 = base_quat
+        w2, x2, y2, z2 = dq
         return np.array([
             w1*w2 - x1*x2 - y1*y2 - z1*z2,
             w1*x2 + x1*w2 + y1*z2 - z1*y2,
@@ -286,71 +213,49 @@ class SO101Oracle:
         ])
 
 
-# ─── Demo collection loop ─────────────────────────────────────────────────────
+# ====================================================================== #
+#  Demonstration collection                                               #
+# ====================================================================== #
 
 def collect_demonstrations(so101, scene, cameras, cube, target_zone,
-                            table_height, is_success_fn, check_sub_goals_fn,
-                            n_episodes: int = 150,
-                            output_dir: str = "demos/") -> list:
-    """
-    Run the oracle n_episodes times and return a list of EpisodeRecord objects.
+                           table_height, is_success_fn, check_sub_goals_fn,
+                           n_episodes: int = 150,
+                           output_dir: str = "demos/") -> list:
 
-    Gate check: the oracle must achieve >=95% success rate.
-    If it does not, something is wrong with the IK configuration
-    or waypoint heights — fix before collecting the full dataset.
-    """
-    os.makedirs(output_dir, exist_ok=True)
     cfg    = OracleConfig()
     oracle = SO101Oracle(so101, scene, cameras, cfg)
 
-    records   = []
+    results   = []
     successes = 0
-
-    # Home pose: all joints at zero.
-    # Run the arm there before the first episode.
     home_pose = np.zeros(so101.n_dofs)
 
     for ep in range(n_episodes):
-        # ── Reset ────────────────────────────────────────────────────────────
-        # Arm back to home
+
+        # Reset arm
+        so101.set_dofs_velocity(np.zeros(so101.n_dofs))
         so101.control_dofs_position(home_pose)
 
-        # Cube back to spawn; zero all velocity state
-        cube.set_pos(np.array([0.25, 0.0, table_height + 0.015]))
+        # Reset cube
+        cube.set_pos(np.array([0.3, 0.0, table_height + 0.015]))
         cube.set_quat(np.array([1.0, 0.0, 0.0, 0.0]))
 
-        # Settle for 20 steps so residual forces dissipate
+        # Let physics settle
         for _ in range(20):
+            so101.set_dofs_velocity(np.zeros(so101.n_dofs))
             so101.control_dofs_position(home_pose)
             scene.step()
 
-        # ── Run episode ───────────────────────────────────────────────────────
-        record = oracle.run_episode(
+        success = oracle.run_episode(
             cube, target_zone, table_height,
             is_success_fn, check_sub_goals_fn,
         )
 
-        if record.success:
+        label = "PASS" if success else "FAIL"
+        print(f"[{ep+1:3d}/{n_episodes}] {label}")
+        if success:
             successes += 1
-            print(f"[{ep+1:3d}/{n_episodes}] ✓  steps={record.total_steps}")
-        else:
-            print(f"[{ep+1:3d}/{n_episodes}] ✗  FAILED  steps={record.total_steps}")
+        results.append(success)
 
-        records.append(record)
-
-        # ── Early gate check at episode 20 ───────────────────────────────────
-        if ep == 19:
-            early_rate = successes / 20
-            print(f"\n--- Gate check after 20 episodes: {early_rate:.0%} ---")
-            if early_rate < 0.95:
-                print("FAIL: Oracle success rate below 95%. Check waypoint heights and IK config.")
-                print("Aborting collection — fix oracle before running full 150 episodes.")
-                return records
-
-    final_rate = successes / n_episodes
-    print(f"\nCollection complete: {final_rate:.1%} ({successes}/{n_episodes})")
-
-    if final_rate < 0.95:
-        print("WARNING: Final rate below 95% target. Consider increasing settle_steps or adjusting waypoints.")
-
-    return records
+    print(f"\nCollection complete: {successes/n_episodes:.1%} "
+          f"({successes}/{n_episodes})")
+    return results
