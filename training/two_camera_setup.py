@@ -7,7 +7,7 @@ from oracle import SO101Oracle, OracleConfig, collect_demonstrations
 
 
 # * The building of the enviroment 
-def build_environment(scene,  table_height):
+def build_environment(scene, table_height):
     # table variables
     table_width = 1.0
     table_depth = 1.0
@@ -46,22 +46,27 @@ def build_environment(scene,  table_height):
             pos=(0.3, 0.0, table_height + 0.015),
         ),
         material=gs.materials.Rigid(
-            rho = 1000.0,        # to the block with mass
-            friction=2.0,
+            rho = 1000.0,
+            friction=3.0,
             coup_friction=1.5,
-            coup_softness=0.001,
+            coup_softness=0.0001,
         ),
         surface=gs.surfaces.Rough(
-            color=(1.0, 0.0, 0.0)       # ! Here you can change the color
-        )
+            color=(1.0, 0.0, 0.0)
+        ),
+        #vis_mode = 'collision'
     )
 
     # ? the target space
+    # FIX #6: target zone is purely visual — make it non-collidable so the
+    # gripper/cube can't physically interact with it during release.
     target_zone = scene.add_entity(
         gs.morphs.Cylinder(
             radius=0.05,
             height=0.001,
-            pos=(0.15, -0.15, table_height + 0.001)
+            pos=(0.15, -0.15, table_height + 0.001),
+            fixed=True,
+            collision=False,   # ← visual marker only; no contact geometry
         ),
         surface=gs.surfaces.Rough(color=(0.0, 1.0, 0.0))
     )
@@ -100,37 +105,33 @@ def attach_cameras(scene, table_height):
     
     return {"front": cam_front, "top": cam_top, "wrist": cam_wrist}
 
-# * Check if the cube has gone to the targed  
+# * Check if the cube has gone to the target  
 def is_sucess(cube, target_zone, min_height, table_height, radius):
     cube_pos = cube.get_pos()
     target_pos = target_zone.get_pos()
 
-    # the cube must be inside the radius of the target
     xy_displacement = torch.norm(cube_pos[:2] - target_pos[:2])
 
-    on_target = xy_displacement < radius    
-    above_table = cube_pos[2] > (table_height + min_height)     # it is not under the table
-    not_too_high  = cube_pos[2] < (table_height + 0.05)         # not floating above the table
+    on_target    = xy_displacement < radius    
+    above_table  = cube_pos[2] > (table_height + min_height)
+    not_too_high = cube_pos[2] < (table_height + 0.05)
 
-    return bool (above_table and on_target and not_too_high)
+    return bool(above_table and on_target and not_too_high)
 
-# * For each episode we reset eveything to as it was
+# * For each episode we reset everything to as it was
 def reset_episode(scene, so101, cube, table_height, home_dofs=None):
-    # arm home pose: all joints at zero 
     if home_dofs is None:
         home_dofs = np.zeros(so101.n_dofs)
     
-    # robot
-    so101.set_dofs_position(home_dofs)                  # home position for the robot 
-    so101.set_dofs_velocity(np.zeros(so101.n_dofs))     # delete any residual velocities
-    so101.control_dofs_position(home_dofs)              # the motors targets are updated so the robot maintains the home position
+    # FIX #7: teleport joints instantly, don't just set motor targets
+    so101.set_dofs_position(home_dofs)
+    so101.set_dofs_velocity(np.zeros(so101.n_dofs))
+    so101.control_dofs_position(home_dofs)
 
-    # cube
-    cube.set_pos(torch.tensor([0.3, 0.0, table_height + 0.015]))   # original position
-    cube.set_quat(np.array([1.0, 0.0, 0.0, 0.0]))   # orient if tumbled
+    cube.set_pos(torch.tensor([0.3, 0.0, table_height + 0.015]))
+    cube.set_quat(np.array([1.0, 0.0, 0.0, 0.0]))
 
-    # Let physics settle for 10 steps before starting the episode
-    for x in range(10):
+    for _ in range(10):
         scene.step()
 
     return home_dofs
@@ -152,9 +153,9 @@ def check_sub_goals(so101, cube, target_zone, table_height, min_height, radius):
 
     #? Sub-goal 2: block lifted > 2 cm off table
     is_elevated = cube_pos[2].item() > (table_height + 0.02)
-    lifted = bool(is_elevated and near_block)       # to avoid tumbling being counted as lifting
+    lifted = bool(is_elevated and near_block)
 
-    #? Sub-goal 3: block placed at target (Pass the missing variables here)
+    #? Sub-goal 3: block placed at target
     placed = is_sucess(cube, target_zone, min_height, table_height, radius)
 
     partial_sum = 0.0
@@ -171,7 +172,6 @@ def check_sub_goals(so101, cube, target_zone, table_height, min_height, radius):
 
 
 def main():
-    # path for the robot arm
     script_dir = os.path.dirname(os.path.abspath(__file__))
     xml_path = os.path.join(script_dir, "../so101_arm/so101_new_calib.xml")
 
@@ -180,22 +180,20 @@ def main():
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
             dt=0.01,
-            substeps=32,          # more substeps = better contact resolution
+            substeps=16,
         ),
         rigid_options=gs.options.RigidOptions(
-            constraint_solver=gs.constraint_solver.Newton,   # more robust than CG for grasping
-            iterations=100,                                  # default is 50
+            constraint_solver=gs.constraint_solver.Newton,
+            iterations=100,
             tolerance=1e-9,
-            constraint_timeconst=0.006,   # <<< KEY: smaller = stiffer contacts, less jello/ default is 0.01; try 0.004–0.006
-            enable_self_collision=True,  # stops finger-finger collision causing clipping
-            box_box_detection=True,       # explicit box-box collision (your cube vs fingers)
-    ),
-
-        #? the lighting level should be kept constants so it doesn't ruin the testing
+            constraint_timeconst=0.006,
+            enable_self_collision=True,
+            box_box_detection=True,
+        ),
         vis_options=gs.options.VisOptions(
             show_world_frame=True,
             world_frame_size=0.5,
-            show_cameras=False,     # Todo: True -> if we want to have the cameras shown in the video (also their FOV is shown)
+            show_cameras=False,
             ambient_light=(0.25, 0.25, 0.25),
             lights=[
                 {"type": "directional", "dir": (-0.5, -0.5, -1.0), "intensity": 8.0, "color": (1.0, 0.97, 0.90)},
@@ -207,70 +205,60 @@ def main():
 
     scene.add_entity(gs.morphs.Plane())
     
-    # the enviroment setup
     table_height = 0.8
     radius = 0.05
-    min_height = 0.005      # if more than it is not considered resting but lifted
+    min_height = 0.005
     cube, target_zone = build_environment(scene, table_height)
     
-    # 1. Define wrapper callbacks that inject the missing threshold variables
     def oracle_success_wrapper(c, tz, th):
         return is_sucess(c, tz, min_height, th, radius)
 
     def oracle_sub_goals_wrapper(robot, c, tz, th):
         return check_sub_goals(robot, c, tz, th, min_height, radius)
 
-
-
-    # ? The robot
     so101 = scene.add_entity(
         gs.morphs.MJCF(
             file=xml_path, 
             pos=(0.0, 0.0, table_height)
-        )
+        ),
+        #vis_mode = 'collision'
     )
 
-    #! Cameras
     cameras = attach_cameras(scene, table_height)
 
-    # Anchor wrist camera to gripper link
     gripper_link = so101.get_link("gripper")
     offset_T = np.eye(4)
-    # Translation offset (x, y, z)
     offset_T[:3, 3] = np.array([0.0, 0.04, 0.1])
-    # To adjust camera orientation, assign a 3x3 rotation matrix to offset_T[:3, :3]
     cameras["wrist"].attach(gripper_link, offset_T)
 
-    # build the scene
     scene.build()
 
     # ── Gripper contact friction ───────────────────────────────────────────
-    # Genesis computes contact friction as the geometric mean of both bodies.
-    # The cube has coup_friction=2.0, so each gripper surface needs >= 2.0
-    # to produce a combined value that can resist gravity during the lift.
     for link_name in ["gripper", "moving_jaw_so101_v1"]:
         link = so101.get_link(link_name)
-        link.set_friction(5.0)          # coulomb friction coefficient
+        link.set_friction(5.0)
 
     # -- Arm joints (0-4): high stiffness for precise IK tracking
     arm_dofs = np.arange(5)
     so101.set_dofs_kp(np.array([4000, 4000, 3000, 2000, 2000]), dofs_idx_local=arm_dofs)
     so101.set_dofs_kv(np.array([400,  400,  300,  200,  200]),  dofs_idx_local=arm_dofs)
     
-    # -- Gripper (DOF 5): use force control, not position control
+    # FIX #4: substantially higher kp/kv on the gripper DOF so the PD spring
+    # produces enough squeeze force to resist gravity + inertia during the
+    # carry phase. Was kp=200/kv=20 — far too weak for a loaded one-sided jaw.
     gripper_dof = np.array([5])
-    so101.set_dofs_kp(np.array([200.0]),  dofs_idx_local=gripper_dof)
-    so101.set_dofs_kv(np.array([20.0]),   dofs_idx_local=gripper_dof)
+    so101.set_dofs_kp(np.array([800.0]),  dofs_idx_local=gripper_dof)   # was 200
+    so101.set_dofs_kv(np.array([80.0]),   dofs_idx_local=gripper_dof)   # was 20
     so101.set_dofs_force_range(
-        lower=np.array([-50.0]),
-        upper=np.array([ 50.0]),
+        lower=np.array([-100.0]),   # was -50 — allow stronger squeeze
+        upper=np.array([ 100.0]),
         dofs_idx_local=gripper_dof,
     )
 
-    # Set friction on all gripper collision links
+    # Set friction on all gripper collision links (second pass after build)
     for link_name in ["gripper", "moving_jaw_so101_v1"]:
         link = so101.get_link(link_name)
-        link.set_friction(3.0)   # match cube surface friction
+        link.set_friction(5.0)   # FIX #4: raised from 3.0 to match first pass
 
     records = collect_demonstrations(
         so101        = so101,
@@ -279,29 +267,24 @@ def main():
         cube         = cube,
         target_zone  = target_zone,
         table_height = table_height,
-        is_success_fn      = oracle_success_wrapper,        # your function
-        check_sub_goals_fn = oracle_sub_goals_wrapper,   # your function
+        is_success_fn      = oracle_success_wrapper,
+        check_sub_goals_fn = oracle_sub_goals_wrapper,
         n_episodes   = 150,
         output_dir   = "demos/baseline/",
     )
     
 
     n_dofs = so101.n_dofs
-
     n_episodes = 2
     max_steps = 200
-
-    # the array that stores all the sums
     sum_metrics = []
 
     for ep in range(n_episodes):
         print(f"--- Starting Episode {ep} ---")
         reset_episode(scene, so101, cube, table_height)
 
-        # we store the max for each episode
         max_sum = 0.0
         achieved_goals = {"near_block": False, "lifted": False, "placed": False}
-
 
         for i in range(max_steps):
             target_pos = np.full(n_dofs, np.sin(i / 50.0))
@@ -309,30 +292,24 @@ def main():
 
             scene.step()
 
-            # Synchronize attached camera pose with rigid link
             cameras["wrist"].move_to_attach()
 
-            # we see the status that every step causes
             status = check_sub_goals(so101, cube, target_zone, table_height, min_height, radius)
             
-            # update the statuses
             max_sum = max(max_sum, status["Sum"])
             achieved_goals["near_block"] |= status["near_block"]
             achieved_goals["lifted"]     |= status["lifted"]
             achieved_goals["placed"]     |= status["placed"]
 
-            # if it was a success
             if status["placed"]:
                 print(f"Task Completed at episode {ep}, step {i}")
                 break
             
-            # we render the cameras every 10 steps 
             if i % 10 == 0:
                 rgb_front, _, _, _ = cameras["front"].render()
                 rgb_top, _, _, _ = cameras["top"].render()
                 rgb_wrist, _, _, _ = cameras["wrist"].render()
                 
-        # some feedback
         print(f"Episode {ep} finished.\n Max Sum: {max_sum:.2f} \n Goals: {achieved_goals}")
 
 if __name__ == "__main__":
