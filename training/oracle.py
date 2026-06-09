@@ -90,6 +90,7 @@ class SO101Oracle:
 
         # Frame buffer filled during run_episode (cleared at episode start)
         self._frames: list[dict] = []
+        self._last_qpos: torch.Tensor | None = None 
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -97,6 +98,7 @@ class SO101Oracle:
                     is_success_fn, check_sub_goals_fn) -> bool:
         """Run one episode; record frames if cameras are provided."""
         self._frames = []
+        self._last_qpos = None
         
         # Per-episode latch dict for sub-goal tracking.
         # Passed through to check_sub_goals_fn so `lifted` stays True
@@ -157,24 +159,23 @@ class SO101Oracle:
 
         frame = {}
 
-        # Images
-        # Only the wrist camera is attached to a rigid link and needs
-        # move_to_attach() each step. Fixed world cameras do not.
         ATTACHED_CAM_KEYS = {"wrist"}
         for key, cam in self.cameras.items():
             if key in ATTACHED_CAM_KEYS:
                 cam.move_to_attach()
             rgb, _, _, _ = cam.render()
-            frame[f"observation.images.{key}"] = rgb  # numpy uint8 [H, W, 3]
+            frame[f"observation.images.{key}"] = rgb
 
-        # Joint state — 6 arm + gripper angles (radians)
-        frame["observation.state"] = qpos[:7].cpu().numpy().astype(np.float32)
+        # State: 6 DOFs (5 arm + 1 gripper)  
+        frame["observation.state"] = qpos[:6].cpu().numpy().astype(np.float32)
 
-        # Action — joint deltas (current - previous), gripper absolute position
-        delta = (qpos - prev_qpos).cpu().numpy().astype(np.float32)
-        action = np.concatenate([delta[:6], [qpos[5].item()]])
+        # Action: per-step delta from the PREVIOUS FRAME, not segment start
+        truly_prev = self._last_qpos if self._last_qpos is not None else qpos
+        delta = (qpos - truly_prev).cpu().numpy().astype(np.float32)
+        action = np.concatenate([delta[:6], [qpos[5].item()]])  # 6 deltas + abs gripper
         frame["action"] = action
 
+        self._last_qpos = qpos.clone()   # update for next step
         self._frames.append(frame)
 
     def _execute_segment(self, target_cart_pos, gripper_target, settle_steps,
@@ -324,7 +325,7 @@ def _save_episode_hdf5(frames: list[dict], episode_id: int,
         /data/observation.images.context   uint8  [T, H, W, 3]
         /data/observation.images.wrist     uint8  [T, H, W, 3]
         /data/observation.state            float32 [T, 6]
-        /data/action                       float32 [T, 7]
+        /data/action                       float32 [T, 6]
         /meta/success                      bool
         /meta/episode_id                   int64
         /meta/language_instruction         str (stored as bytes)
@@ -336,8 +337,8 @@ def _save_episode_hdf5(frames: list[dict], episode_id: int,
     img_keys = [k.replace("observation.images.", "")
                 for k in frames[0] if k.startswith("observation.images.")]
  
-    state = np.stack([f["observation.state"] for f in frames])   # [T, 7]
-    acts  = np.stack([f["action"]            for f in frames])   # [T, 7]
+    state = np.stack([f["observation.state"] for f in frames])   # [T, 6]
+    acts  = np.stack([f["action"]            for f in frames])   # [T, 6]
  
     with h5py.File(path, "w") as hf:
         data = hf.create_group("data")
@@ -449,8 +450,8 @@ def collect_demonstrations(so101, scene, cameras, cube, target_zone,
         "success_rate":         round(successes / n_episodes, 4),
         "language_instruction": LANGUAGE_INSTRUCTION,
         "camera_keys":          ["context", "wrist"],
-        "state_dim":            7,
-        "action_dim":           7,
+        "state_dim":            6,
+        "action_dim":           6,
         "image_resolution":     [224, 224],
     }
     with open(out_dir / "meta.json", "w") as f:
@@ -464,8 +465,8 @@ def collect_demonstrations(so101, scene, cameras, cube, target_zone,
         "failure_rate":         round(saved_fails / n_episodes, 4),
         "language_instruction": LANGUAGE_INSTRUCTION,
         "camera_keys":          ["context", "wrist"],
-        "state_dim":            7,
-        "action_dim":           7,
+        "state_dim":            6,
+        "action_dim":           6,
         "image_resolution":     [224, 224],
     }
     with open(fail_dir / "meta.json", "w") as f:

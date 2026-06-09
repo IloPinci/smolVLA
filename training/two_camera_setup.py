@@ -88,9 +88,9 @@ def attach_cameras(scene, so101, table_height):
     # ── Context camera (fixed, world frame) ──────────────────────────────────
     context_cam = scene.add_camera(
         res=(224, 224),
-        pos=(0.9, -0.4, table_height + 0.55),   # front-right, slightly above table
+        pos=(0.5, -0.4, table_height + 0.55),   # front-right, slightly above table
         lookat=(0.2, 0.0, table_height + 0.05),  # looking at the workspace centre
-        fov=55,
+        fov=60,
         GUI=False,
     )
     
