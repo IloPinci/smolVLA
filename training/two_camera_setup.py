@@ -87,7 +87,7 @@ def attach_cameras(scene, so101, table_height):
 
     # ── Context camera (fixed, world frame) ──────────────────────────────────
     context_cam = scene.add_camera(
-        res=(224, 224),
+        res=(256, 256),
         pos=(0.5, -0.4, table_height + 0.55),   # front-right, slightly above table
         lookat=(0.2, 0.0, table_height + 0.05),  # looking at the workspace centre
         fov=60,
@@ -96,7 +96,7 @@ def attach_cameras(scene, so101, table_height):
     
     #! Camera top — fixed, world frame, not rendered yet but ready to use
     top_cam = scene.add_camera(
-        res=(224, 224),
+        res=(256, 256),
         pos=(0.0, 0.0, table_height + 1.0),
         lookat=(0.0, 0.0, table_height + 0.1),
         fov=65,
@@ -106,7 +106,7 @@ def attach_cameras(scene, so101, table_height):
     # ── Wrist camera (attached to gripper link) ───────────────────────────────
     # We create the camera at a dummy world position; attach() overrides it.
     wrist_cam = scene.add_camera(
-        res=(224, 224),
+        res=(256, 256),
         pos=(0.0, 0.0, 0.0),   # placeholder — will be overridden by attach()
         lookat=(1.0, 0.0, 0.0),
         fov=50,
@@ -293,11 +293,7 @@ def main():
         return check_sub_goals(robot, c, tz, th, radius=0.05, min_height=0.005, _latch=latch)
 
     # ── Collect demonstrations ────────────────────────────────────────────────
-    # For nominal collection, pass only context + wrist to the oracle.
-    # top_cam is registered in the scene (so it can be used in perturbation
-    # experiments later) but excluded here to avoid rendering overhead and
-    # to keep the nominal dataset consistent with the 2-camera training setup.
-    nominal_cameras = {k: v for k, v in cameras.items() if k != "top"}
+    nominal_cameras = cameras 
     collect_demonstrations(
         so101=so101,
         scene=scene,

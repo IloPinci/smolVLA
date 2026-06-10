@@ -35,16 +35,17 @@ except ImportError:
 # ══════════════════════════════════════════════════════════════════════════════
 
 EXPECTED_DATASETS = {
-    "data/observation.images.context": {"dtype": "uint8",   "ndim": 4},  # [T,224,224,3]
-    "data/observation.images.wrist":   {"dtype": "uint8",   "ndim": 4},
-    "data/observation.state":          {"dtype": "float32", "ndim": 2},  # [T,6]
-    "data/action":                     {"dtype": "float32", "ndim": 2},  # [T,7]
-    "meta/success":                    {"dtype": None,      "ndim": 0},  # scalar
+    "data/observation.images.camera1": {"dtype": "uint8", "ndim": 4},
+    "data/observation.images.camera2": {"dtype": "uint8", "ndim": 4},
+    "data/observation.images.camera3": {"dtype": "uint8", "ndim": 4},
+    "data/observation.state":          {"dtype": "float32", "ndim": 2},
+    "data/action":                     {"dtype": "float32", "ndim": 2},
+    "meta/success":                    {"dtype": None,      "ndim": 0},
     "meta/episode_id":                 {"dtype": None,      "ndim": 0},
     "meta/language_instruction":       {"dtype": None,      "ndim": 0},
 }
 
-IMG_SHAPE   = (224, 224, 3)
+IMG_SHAPE   = (256, 256, 3)
 STATE_DIM   = 6
 ACTION_DIM  = 6
 MIN_FRAMES  = 20   # any episode shorter than this is probably corrupt
@@ -100,14 +101,19 @@ def check_episode(path: Path) -> dict:
                 result["errors"].append(f"only {T} frames — episode too short (min {MIN_FRAMES})")
                 result["ok"] = False
 
-            ctx_shape = f["data/observation.images.context"].shape[1:]  # H,W,C
+            ctx_shape = f["data/observation.images.camera1"].shape[1:]  # H,W,C
             if ctx_shape != IMG_SHAPE:
                 result["errors"].append(f"context image shape {ctx_shape} != {IMG_SHAPE}")
                 result["ok"] = False
 
-            wrist_shape = f["data/observation.images.wrist"].shape[1:]
+            wrist_shape = f["data/observation.images.camera2"].shape[1:]
             if wrist_shape != IMG_SHAPE:
                 result["errors"].append(f"wrist image shape {wrist_shape} != {IMG_SHAPE}")
+                result["ok"] = False
+
+            top_shape = f["data/observation.images.camera3"].shape[1:]
+            if top_shape != IMG_SHAPE:
+                result["errors"].append(f"top image shape {top_shape} != {IMG_SHAPE}")
                 result["ok"] = False
 
             state_dim = f["data/observation.state"].shape[1]
@@ -122,8 +128,9 @@ def check_episode(path: Path) -> dict:
 
             # ── Temporal alignment ────────────────────────────────────────────
             for key in [
-                "data/observation.images.context",
-                "data/observation.images.wrist",
+                "data/observation.images.camera1",
+                "data/observation.images.camera2",
+                "data/observation.images.camera3",
                 "data/observation.state",
             ]:
                 if f[key].shape[0] != T:
@@ -160,18 +167,23 @@ def check_episode(path: Path) -> dict:
                 )
 
             # Images should not be all-black (rendering failure)
-            ctx_mean = float(f["data/observation.images.context"][:].mean())
+            ctx_mean = float(f["data/observation.images.camera1"][:].mean())
             if ctx_mean < 5.0:
                 result["errors"].append(
                     f"context images look all-black (mean pixel = {ctx_mean:.1f})"
                 )
                 result["ok"] = False
 
-            wrist_mean = float(f["data/observation.images.wrist"][:].mean())
+            wrist_mean = float(f["data/observation.images.camera2"][:].mean())
             if wrist_mean < 5.0:
                 result["errors"].append(
                     f"wrist images look all-black (mean pixel = {wrist_mean:.1f})"
                 )
+                result["ok"] = False
+
+            top_mean   = float(f["data/observation.images.camera3"][:].mean())
+            if top_mean < 5.0:
+                result["errors"].append(f"top images look all-black (mean pixel = {top_mean:.1f})")
                 result["ok"] = False
 
             # meta
@@ -198,29 +210,34 @@ def render_frame_grid(paths: list[Path], out_path: Path, n_episodes: int = 5):
 
     sample = random.sample(paths, min(n_episodes, len(paths)))
     n = len(sample)
-    fig, axes = plt.subplots(n, 6, figsize=(18, 3 * n))
+    fig, axes = plt.subplots(n, 9, figsize=(27, 3 * n))
     if n == 1:
         axes = axes[None, :]   # keep 2-D indexing
 
-    fig.suptitle("Dataset frame sample — context (left 3) · wrist (right 3)", fontsize=11)
+    fig.suptitle("Dataset frame sample — camera1 (cols 1-3) · camera2 (cols 4-6) · camera3 (cols 7-9)", fontsize=11)
 
     for row, path in enumerate(sample):
         with h5py.File(path, "r") as f:
-            ctx   = f["data/observation.images.context"][:]
-            wrist = f["data/observation.images.wrist"][:]
-            T     = ctx.shape[0]
+            cam1  = f["data/observation.images.camera1"][:]
+            cam2  = f["data/observation.images.camera2"][:]
+            cam3  = f["data/observation.images.camera3"][:]
+            T     = cam1.shape[0]
 
         indices = [0, T // 2, T - 1]
         labels  = ["t=0", f"t={T//2}", f"t={T-1}"]
 
         for col, (idx, lbl) in enumerate(zip(indices, labels)):
-            axes[row, col].imshow(ctx[idx])
-            axes[row, col].set_title(f"ctx {lbl}", fontsize=7)
+            axes[row, col].imshow(cam1[idx])
+            axes[row, col].set_title(f"cam1 {lbl}", fontsize=7)
             axes[row, col].axis("off")
 
-            axes[row, col + 3].imshow(wrist[idx])
-            axes[row, col + 3].set_title(f"wrist {lbl}", fontsize=7)
+            axes[row, col + 3].imshow(cam2[idx])
+            axes[row, col + 3].set_title(f"cam2 {lbl}", fontsize=7)
             axes[row, col + 3].axis("off")
+
+            axes[row, col + 6].imshow(cam3[idx])
+            axes[row, col + 6].set_title(f"cam3 {lbl}", fontsize=7)
+            axes[row, col + 6].axis("off")
 
         axes[row, 0].set_ylabel(path.stem, fontsize=7, rotation=0, labelpad=60, va="center")
 

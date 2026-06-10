@@ -82,7 +82,7 @@ class SmolVLAAgent:
         self.policy.reset()
 
     @torch.no_grad()
-    def act(self, context_rgb: np.ndarray, wrist_rgb: np.ndarray,
+    def act(self, context_rgb: np.ndarray, wrist_rgb: np.ndarray, top_rgb: np.ndarray,
             joint_state: np.ndarray) -> np.ndarray:
         """
         Parameters
@@ -102,11 +102,12 @@ class SmolVLAAgent:
         # Images: [1, C, H, W] float32 in [0, 1]
         ctx_t   = to_tensor(context_rgb).permute(0, 3, 1, 2) / 255.0
         wrist_t = to_tensor(wrist_rgb).permute(0, 3, 1, 2)   / 255.0
+        top_t   = to_tensor(top_rgb).permute(0, 3, 1, 2)     / 255.0
 
         obs = {
             "observation.images.camera1": ctx_t,
             "observation.images.camera2": wrist_t,
-            "observation.images.camera3": wrist_t,  # placeholder duplicate
+            "observation.images.camera3": top_t, 
             "observation.state":          to_tensor(joint_state),
             "task":                       [LANGUAGE_INSTRUCTION],
         }
@@ -231,6 +232,7 @@ def run_rollout(agent, scene, so101, cube, target_zone,
     agent.reset()
     latch = {"lifted": False}
 
+    top_cam     = cameras["top"]
     wrist_cam   = cameras["wrist"]
     context_cam = cameras["context"]
 
@@ -248,11 +250,12 @@ def run_rollout(agent, scene, so101, cube, target_zone,
         wrist_cam.move_to_attach()
         ctx_rgb,   _, _, _ = context_cam.render()
         wrist_rgb, _, _, _ = wrist_cam.render()
+        top_rgb,   _, _, _ = top_cam.render()
 
         qpos = so101.get_dofs_position().cpu().numpy()    # [6]
 
         # ── Policy inference ──────────────────────────────────────────────────
-        action = agent.act(ctx_rgb, wrist_rgb, qpos[:6])  # [7]
+        action = agent.act(ctx_rgb, wrist_rgb, top_rgb, qpos[:6])  # [7]
 
         # ── Apply action ──────────────────────────────────────────────────────
         # Arm: current + delta

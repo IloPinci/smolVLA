@@ -6,10 +6,10 @@ episode and writes a LeRobot-compatible HDF5 dataset to output_dir.
 
 Dataset layout (one HDF5 file per episode):
     /data/
-        observation.images.context     uint8 [T, 224, 224, 3]
-        observation.images.wrist       uint8 [T, 224, 224, 3]
+        observation.images.context     uint8 [T, 256, 256, 3]
+        observation.images.wrist       uint8 [T, 256, 256, 3]
         observation.state              float32 [T, 6]   joint angles
-        action                         float32 [T, 7]   6 joint deltas + gripper
+        action                         float32 [T, 6]    joint deltas + gripper
     /meta/
         success                        bool scalar
         episode_id                     int scalar
@@ -81,7 +81,7 @@ class SO101Oracle:
     def __init__(self, so101, scene, cameras=None, cfg: OracleConfig = OracleConfig()):
         self.robot    = so101
         self.scene    = scene
-        self.cameras  = cameras          # dict {"context": cam, "wrist": cam}
+        self.cameras  = cameras         
         self.cfg      = cfg
         self._rng     = np.random.default_rng()
 
@@ -157,6 +157,13 @@ class SO101Oracle:
         if self.cameras is None:
             return
 
+        # we "rename" the cameras so they fit with what the 
+        KEY_REMAP = {
+            "context": "camera1",
+            "wrist":   "camera2",
+            "top":     "camera3",
+}
+
         frame = {}
 
         ATTACHED_CAM_KEYS = {"wrist"}
@@ -164,7 +171,8 @@ class SO101Oracle:
             if key in ATTACHED_CAM_KEYS:
                 cam.move_to_attach()
             rgb, _, _, _ = cam.render()
-            frame[f"observation.images.{key}"] = rgb
+            remapped_key = KEY_REMAP.get(key, key)
+            frame[f"observation.images.{remapped_key}"] = rgb
 
         # State: 6 DOFs (5 arm + 1 gripper)  
         frame["observation.state"] = qpos[:6].cpu().numpy().astype(np.float32)
@@ -449,10 +457,10 @@ def collect_demonstrations(so101, scene, cameras, cube, target_zone,
         "n_episodes_saved":     saved_eps,
         "success_rate":         round(successes / n_episodes, 4),
         "language_instruction": LANGUAGE_INSTRUCTION,
-        "camera_keys":          ["context", "wrist"],
+        "camera_keys":          ["camera1", "camera2", "camera3"],
         "state_dim":            6,
         "action_dim":           6,
-        "image_resolution":     [224, 224],
+        "image_resolution":     [256, 256],
     }
     with open(out_dir / "meta.json", "w") as f:
         json.dump(meta, f, indent=2)
@@ -464,10 +472,10 @@ def collect_demonstrations(so101, scene, cameras, cube, target_zone,
         "n_failures_saved":     saved_fails,
         "failure_rate":         round(saved_fails / n_episodes, 4),
         "language_instruction": LANGUAGE_INSTRUCTION,
-        "camera_keys":          ["context", "wrist"],
+        "camera_keys":          ["camera1", "camera2", "camera3"],
         "state_dim":            6,
         "action_dim":           6,
-        "image_resolution":     [224, 224],
+        "image_resolution":     [256, 256],
     }
     with open(fail_dir / "meta.json", "w") as f:
         json.dump(fail_meta, f, indent=2)
