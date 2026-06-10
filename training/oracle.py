@@ -152,7 +152,7 @@ class SO101Oracle:
 
     # ── Segment execution ─────────────────────────────────────────────────────
 
-    def _record_step(self, qpos: torch.Tensor, prev_qpos: torch.Tensor):
+    def _record_step(self, qpos: torch.Tensor):
         """Capture one observation+action frame if cameras are attached."""
         if self.cameras is None:
             return
@@ -172,7 +172,7 @@ class SO101Oracle:
         # Action: per-step delta from the PREVIOUS FRAME, not segment start
         truly_prev = self._last_qpos if self._last_qpos is not None else qpos
         delta = (qpos - truly_prev).cpu().numpy().astype(np.float32)
-        action = np.concatenate([delta[:6], [qpos[5].item()]])  # 6 deltas + abs gripper
+        action = np.concatenate([delta[:5], [qpos[5].item()]])  # 5 deltas + abs gripper
         frame["action"] = action
 
         self._last_qpos = qpos.clone()   # update for next step
@@ -205,7 +205,7 @@ class SO101Oracle:
             self.robot.control_dofs_position(qpos[_ARM_DOFS],    dofs_idx_local=_ARM_DOFS)
             self.robot.control_dofs_position(qpos[_GRIPPER_DOF], dofs_idx_local=_GRIPPER_DOF)
             self.scene.step()
-            self._record_step(qpos, prev_qpos)
+            self._record_step(qpos)
             return check_sub_goals_fn(self.robot, cube, target_zone, table_height, latch)["placed"]
 
         for interp_qpos in interp_configs:
@@ -245,13 +245,13 @@ class SO101Oracle:
             self.robot.control_dofs_position(interp_qpos[_ARM_DOFS],    dofs_idx_local=_ARM_DOFS)
             self.robot.control_dofs_position(interp_qpos[_GRIPPER_DOF], dofs_idx_local=_GRIPPER_DOF)
             self.scene.step()
-            self._record_step(interp_qpos, prev_qpos)
+            self._record_step(interp_qpos)
 
         for _ in range(15):   # arm settle
             self.robot.control_dofs_position(closed_qpos[_ARM_DOFS],    dofs_idx_local=_ARM_DOFS)
             self.robot.control_dofs_position(closed_qpos[_GRIPPER_DOF], dofs_idx_local=_GRIPPER_DOF)
             self.scene.step()
-            self._record_step(closed_qpos, prev_qpos)
+            self._record_step(closed_qpos)
 
         # Phase 2: open gripper, arm stationary
         open_qpos    = closed_qpos.clone()
@@ -261,14 +261,14 @@ class SO101Oracle:
             self.robot.control_dofs_position(open_qpos[_ARM_DOFS],    dofs_idx_local=_ARM_DOFS)
             self.robot.control_dofs_position(open_qpos[_GRIPPER_DOF], dofs_idx_local=_GRIPPER_DOF)
             self.scene.step()
-            self._record_step(open_qpos, closed_qpos)
+            self._record_step(open_qpos)
 
         # Phase 3: settle — cube drops onto target
         for _ in range(settle_steps):
             self.robot.control_dofs_position(open_qpos[_ARM_DOFS],    dofs_idx_local=_ARM_DOFS)
             self.robot.control_dofs_position(open_qpos[_GRIPPER_DOF], dofs_idx_local=_GRIPPER_DOF)
             self.scene.step()
-            self._record_step(open_qpos, open_qpos)
+            self._record_step(open_qpos)
 
         return is_success_fn(cube, target_zone, table_height)
 
