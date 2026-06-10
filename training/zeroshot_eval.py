@@ -45,7 +45,7 @@ def _import_from(module_name, file_path):
     return mod
 
 _script_dir = pathlib.Path(__file__).parent
-_setup      = _import_from("two_camera_setup", _script_dir / "training" / "two_camera_setup.py")
+_setup      = _import_from("two_camera_setup", _script_dir / "two_camera_setup.py")
 
 build_environment  = _setup.build_environment
 attach_cameras     = _setup.attach_cameras
