@@ -28,7 +28,7 @@ import genesis as gs
 
 # ── LeRobot / SmolVLA ─────────────────────────────────────────────────────────
 try:
-    from lerobot.common.policies.smolvla.modeling_smolvla import SmolVLAPolicy
+    from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 except ImportError:
     print("[error] lerobot not installed or SmolVLA policy not found.")
     print("        Run: pip install -e '.[smolvla]' inside your lerobot clone.")
@@ -72,9 +72,9 @@ class SmolVLAAgent:
     def __init__(self, checkpoint: str = "lerobot/smolvla_base", device: str = "cuda"):
         self.device = device
         print(f"[info] loading SmolVLA checkpoint: {checkpoint}")
-        self.policy = SmolVLAPolicy.from_pretrained(checkpoint)
-        self.policy.to(device)
+        self.policy = SmolVLAPolicy.from_pretrained(checkpoint, device=device)
         self.policy.eval()
+        self.tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolVLM2-500M-Video-Instruct")
         print("[info] SmolVLA loaded successfully.")
 
     def reset(self):
@@ -82,8 +82,7 @@ class SmolVLAAgent:
         self.policy.reset()
 
     @torch.no_grad()
-    def act(self, context_rgb: np.ndarray, wrist_rgb: np.ndarray, top_rgb: np.ndarray,
-            joint_state: np.ndarray) -> np.ndarray:
+    def act(self, context_rgb: np.ndarray, wrist_rgb: np.ndarray, top_rgb: np.ndarray, joint_state: np.ndarray) -> np.ndarray:
         """
         Parameters
         ----------
@@ -104,15 +103,26 @@ class SmolVLAAgent:
         wrist_t = to_tensor(wrist_rgb).permute(0, 3, 1, 2)   / 255.0
         top_t   = to_tensor(top_rgb).permute(0, 3, 1, 2)     / 255.0
 
+        # Tokenize the language instruction
+        enc = self.tokenizer(
+            [LANGUAGE_INSTRUCTION],
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=64,
+        )
+
         obs = {
-            "observation.images.camera1": ctx_t,
-            "observation.images.camera2": wrist_t,
-            "observation.images.camera3": top_t, 
-            "observation.state":          to_tensor(joint_state),
-            "task":                       [LANGUAGE_INSTRUCTION],
+            "observation.images.camera1":          ctx_t,
+            "observation.images.camera2":          wrist_t,
+            "observation.images.camera3":          top_t,
+            "observation.state":                   to_tensor(joint_state),
+            #! tokenized language
+            "observation.language.tokens":         enc["input_ids"].to(self.device),
+            "observation.language.attention_mask": enc["attention_mask"].bool().to(self.device),
         }
 
-        action_t = self.policy.select_action(obs)  # [1, 7] or [1, chunk, 7]
+        action_t = self.policy.select_action(obs)  # [1, action_dim] or [1, chunk, action_dim]
 
         # Handle chunked output — take first action in chunk
         if action_t.ndim == 3:
