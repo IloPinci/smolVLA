@@ -87,13 +87,13 @@ class SmolVLAAgent:
         """
         Parameters
         ----------
-        context_rgb  : uint8 [224, 224, 3]
-        wrist_rgb    : uint8 [224, 224, 3]
+        context_rgb  : uint8 [256, 256, 3]
+        wrist_rgb    : uint8 [256, 256, 3]
         joint_state  : float32 [6]   joint angles (radians)
 
         Returns
         -------
-        action : float32 [7]   6 joint deltas + gripper absolute position
+        action : float32 [6]   6 joint deltas + gripper absolute position
         """
         def to_tensor(arr, dtype=torch.float32):
             t = torch.from_numpy(arr).to(dtype=dtype, device=self.device)
@@ -104,8 +104,9 @@ class SmolVLAAgent:
         wrist_t = to_tensor(wrist_rgb).permute(0, 3, 1, 2)   / 255.0
 
         obs = {
-            "observation.images.context": ctx_t,
-            "observation.images.wrist":   wrist_t,
+            "observation.images.camera1": ctx_t,
+            "observation.images.camera2": wrist_t,
+            "observation.images.camera3": wrist_t,  # placeholder duplicate
             "observation.state":          to_tensor(joint_state),
             "task":                       [LANGUAGE_INSTRUCTION],
         }
@@ -256,8 +257,8 @@ def run_rollout(agent, scene, so101, cube, target_zone,
         # ── Apply action ──────────────────────────────────────────────────────
         # Arm: current + delta
         arm_target     = qpos[:5] + action[:5]
-        # Gripper: absolute position from action[6]
-        gripper_target = np.array([action[6]])
+        # Gripper: absolute position from action[5]
+        gripper_target = np.array([action[5]])
 
         so101.control_dofs_position(arm_target,     dofs_idx_local=arm_dofs)
         so101.control_dofs_position(gripper_target, dofs_idx_local=gripper_dof)
