@@ -20,6 +20,7 @@ import os
 import sys
 from pathlib import Path
 
+import imageio.v3 as iio
 import numpy as np
 import torch
 from transformers import AutoTokenizer
@@ -221,6 +222,7 @@ def reset_episode(scene, so101, cube, target_zone, table_height, rng):
         so101.control_dofs_position(home)
         scene.step()
 
+    return cube_xy, target_xy
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Run one rollout
@@ -229,10 +231,36 @@ def reset_episode(scene, so101, cube, target_zone, table_height, rng):
 MAX_STEPS    = 3000   # 30 sim-seconds at dt=0.01
 ARM_DOFS     = np.arange(5)
 GRIPPER_DOF  = np.array([5])
+RECORD_EVERY = 5   # save 1 frame per 5 steps → ~600 frames max per episode
+
+def _save_episode_videos(r: dict, tag: str, video_dir: Path, fps: int = 15):
+    """
+    Save three side-by-side MP4s per episode:
+      <tag>_context.mp4   — context (third-person) camera
+      <tag>_wrist.mp4     — wrist camera
+      <tag>_combined.mp4  — all three cameras tiled horizontally
+    """
+    
+
+    def _write(frames, path):
+        if frames:
+            iio.imwrite(str(path), frames, fps=fps, codec="libx264",
+                        output_params=["-crf", "22", "-pix_fmt", "yuv420p"])
+
+    _write(r["vid_context"], video_dir / f"{tag}_context.mp4")
+    _write(r["vid_wrist"],   video_dir / f"{tag}_wrist.mp4")
+    _write(r["vid_top"],     video_dir / f"{tag}_top.mp4")
+
+    # Combined: tile context | wrist | top horizontally
+    combined = []
+    for ctx, wri, top in zip(r["vid_context"], r["vid_wrist"], r["vid_top"]):
+        combined.append(np.concatenate([ctx, wri, top], axis=1))
+    _write(combined, video_dir / f"{tag}_combined.mp4")
 
 
 def run_rollout(agent, scene, so101, cube, target_zone,
-                cameras, table_height) -> dict:
+                cameras, table_height,
+                cube_xy=None, target_xy=None) -> dict:
     """
     Run one episode of the SmolVLA policy and return a results dict.
     Action interpretation:
@@ -256,6 +284,11 @@ def run_rollout(agent, scene, so101, cube, target_zone,
     arm_dofs    = np.arange(5)
     gripper_dof = np.array([5])
 
+    # Frame buffers — one list per camera
+    vid_context = []
+    vid_wrist   = []
+    vid_top     = []
+
     while step < MAX_STEPS:
         # ── Render observations ───────────────────────────────────────────────
         wrist_cam.move_to_attach()
@@ -278,6 +311,12 @@ def run_rollout(agent, scene, so101, cube, target_zone,
         so101.control_dofs_position(gripper_target, dofs_idx_local=gripper_dof)
         scene.step()
 
+        # Record frames every N steps
+        if step % RECORD_EVERY == 0:
+            vid_context.append(ctx_rgb.copy())
+            vid_wrist.append(wrist_rgb.copy())
+            vid_top.append(top_rgb.copy())
+
         # ── Sub-goal tracking ─────────────────────────────────────────────────
         sg = check_sub_goals(so101, cube, target_zone, table_height, _latch=latch)
         reached = reached or sg["near_block"]
@@ -299,6 +338,11 @@ def run_rollout(agent, scene, so101, cube, target_zone,
         "reached":  reached,
         "lifted":   lifted,
         "placed":   placed,
+        "cube_xy":   cube_xy.tolist() if cube_xy is not None else None,
+        "target_xy": target_xy.tolist() if target_xy is not None else None,
+        "vid_context": vid_context,
+        "vid_wrist":   vid_wrist,
+        "vid_top":     vid_top,
     }
 
 
@@ -334,18 +378,36 @@ def main():
     print(f"{'ep':>4}  {'result':>6}  {'pss':>5}  {'steps':>6}  sub-goals")
     print("─" * 55)
 
-    for ep in range(args.n):
-        reset_episode(scene, so101, cube, target_zone, table_height, rng)
-        r = run_rollout(agent, scene, so101, cube, target_zone,
-                        cameras, table_height)
-        r["episode"] = ep
-        records.append(r)
 
-        label = "PASS ✓" if r["success"] else "FAIL ✗"
-        sg_str = (f"reach={'Y' if r['reached'] else 'n'}  "
-                  f"lift={'Y' if r['lifted'] else 'n'}  "
-                  f"place={'Y' if r['placed'] else 'n'}")
-        print(f"{ep+1:>4}  {label:>6}  {r['pss']:>5.3f}  {r['steps']:>6}  {sg_str}")
+    MAX_SUCCESS_VIDEOS = 5
+    success_video_count = 0
+    video_dir = Path(args.out).parent / "videos"
+    video_dir.mkdir(parents=True, exist_ok=True)
+
+
+    for ep in range(args.n):
+        cube_xy, target_xy = reset_episode(scene, so101, cube, target_zone, table_height, rng)
+        r = run_rollout(agent, scene, so101, cube, target_zone,
+                        cameras, table_height,
+                        cube_xy=cube_xy, target_xy=target_xy)
+        r["episode"] = ep
+
+        # ── Save videos ──────────────────────────────────────────────────────
+        save_video = False
+        if r["success"] and success_video_count < MAX_SUCCESS_VIDEOS:
+            tag = f"ep{ep:02d}_pass"
+            save_video = True
+            success_video_count += 1
+        elif not r["success"]:
+            tag = f"ep{ep:02d}_fail"
+            save_video = True
+
+        if save_video:
+            _save_episode_videos(r, tag, video_dir)
+
+        # Strip frame data before storing in records (keep CSV clean)
+        r.pop("vid_context"); r.pop("vid_wrist"); r.pop("vid_top")
+        records.append(r)
 
     # ── Aggregate ─────────────────────────────────────────────────────────────
     n_success = sum(r["success"] for r in records)
