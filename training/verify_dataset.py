@@ -46,7 +46,7 @@ EXPECTED_DATASETS = {
 
 IMG_SHAPE   = (224, 224, 3)
 STATE_DIM   = 6
-ACTION_DIM  = 7
+ACTION_DIM  = 6
 MIN_FRAMES  = 20   # any episode shorter than this is probably corrupt
 
 
@@ -138,7 +138,7 @@ def check_episode(path: Path) -> dict:
 
             result["state_min"] = float(state.min())
             result["state_max"] = float(state.max())
-            result["action_max_delta"] = float(np.abs(action[:, :6]).max())
+            result["action_max_delta"] = float(np.abs(action[:, :5]).max())
 
             # Joint angles should be within ±3π (generous bound — catches NaN/Inf)
             if not np.isfinite(state).all():
