@@ -22,6 +22,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from transformers import AutoTokenizer
 
 # ── Genesis ───────────────────────────────────────────────────────────────────
 import genesis as gs
@@ -95,7 +96,7 @@ class SmolVLAAgent:
         action : float32 [6]   6 joint deltas + gripper absolute position
         """
         def to_tensor(arr, dtype=torch.float32):
-            t = torch.from_numpy(arr).to(dtype=dtype, device=self.device)
+            t = torch.from_numpy(arr.copy()).to(dtype=dtype, device=self.device)
             return t.unsqueeze(0)   # add batch dim
 
         # Images: [1, C, H, W] float32 in [0, 1]
