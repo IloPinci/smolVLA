@@ -318,7 +318,7 @@ def main():
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
 
     # ── Build scene ───────────────────────────────────────────────────────────
-    xml_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), args.xml)
+    xml_path = os.path.abspath(args.xml)
     scene, so101, cube, target_zone, cameras, table_height = build_scene(xml_path)
 
     # ── Load policy ───────────────────────────────────────────────────────────
