@@ -120,7 +120,7 @@ def find_last_checkpoint(out_dir: Path) -> Path | None:
 #  Build training command
 # ══════════════════════════════════════════════════════════════════════════════
 
-def build_command(module: str, args) -> list[str]:
+def build_command(args) -> list[str]:
     """
     Build the draccus/lerobot_train command.
 
@@ -145,25 +145,25 @@ def build_command(module: str, args) -> list[str]:
     device = "cpu" if args.cpu else "cuda"
 
     cmd = [
-        sys.executable, "-m", module,
-        # draccus overrides — NO leading "--"
-        f"policy.pretrained_path=lerobot/smolvla_base",
-        f"dataset.repo_id=local/genesis_pickplace",
-        f"dataset.root={dataset_dir}",
-        f"output_dir={args.out_dir}",
-        f"steps={args.steps}",
-        f"batch_size={args.batch_size}",
-        f"save_freq={args.save_freq}",
-        f"policy.device={device}",
-        f"wandb.enable={'true' if args.wandb else 'false'}",
-        f"job_name=smolvla_genesis_finetune",
+        sys.executable, "-m", "lerobot.scripts.lerobot_train",
+        "--policy.pretrained_path", "lerobot/smolvla_base",
+        "--policy.type", "smolvla",
+        "--dataset.repo_id", "local/genesis_pickplace",
+        "--dataset.root", str(dataset_dir),
+        "--output_dir", args.out_dir,
+        "--steps", str(args.steps),
+        "--batch_size", str(args.batch_size),
+        "--save_freq", str(args.save_freq),
+        "--policy.device", device,
+        "--wandb.enable", "true" if args.wandb else "false",
+        "--job_name", "smolvla_genesis_finetune",
     ]
 
     if args.wandb and args.wandb_project:
-        cmd.append(f"wandb.project={args.wandb_project}")
+        cmd += ["--wandb.project", args.wandb_project]
 
     if args.eval_freq:
-        cmd.append(f"eval_freq={args.eval_freq}")
+        cmd += ["--eval_freq", str(args.eval_freq)]
 
     return cmd
 
@@ -206,7 +206,7 @@ def main():
     print(f"[ok] Using train script: {train_script}")
 
     # ── Build command ─────────────────────────────────────────────────────────
-    cmd = build_command(train_script, args)
+    cmd = build_command(args)
 
     print(f"\n── Training command ──────────────────────────────────────")
     print("  " + " \\\n    ".join(cmd))
