@@ -220,7 +220,7 @@ def write_meta(out_dir: Path, episodes_meta: list[dict], fps: int,
         }
 
     info = {
-        "codebase_version":  "v2.1",
+        "codebase_version":  "v3.0",
         "robot_type":        "so101",
         "total_episodes":    n_eps,
         "total_frames":      total_frames,
@@ -261,7 +261,7 @@ def main():
     parser.add_argument("--hdf5_dir", default="demos/baseline/",
                         help="Directory containing episode_*.hdf5 files")
     parser.add_argument("--out_dir",  default="demos/lerobot/",
-                        help="Output directory for LeRobot v2.1 dataset")
+                        help="Output directory for LeRobot v3.0 dataset")
     parser.add_argument("--fps",      type=int, default=30,
                         help="Frame rate for video encoding")
     parser.add_argument("--val_frac", type=float, default=0.2,
