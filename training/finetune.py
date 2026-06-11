@@ -199,7 +199,7 @@ def main():
 
     dataset_dir = Path(args.dataset_dir)
     out_dir     = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    #out_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Validate dataset ──────────────────────────────────────────────────────
     info = validate_dataset(dataset_dir)
@@ -234,7 +234,7 @@ def main():
         "last_checkpoint": None,
         "n_action_steps_patched": False,
     }
-    run_meta_path = out_dir / "finetune_run.json"
+    run_meta_path = Path(args.out_dir).parent / f"finetune_run_pending.json"
     with open(run_meta_path, "w") as f:
         json.dump(run_meta, f, indent=2)
 
@@ -257,6 +257,10 @@ def main():
         log_lines.append(line)
 
     proc.wait()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    final_meta_path = out_dir / "finetune_run.json"
+    run_meta_path.rename(final_meta_path)
+    run_meta_path = final_meta_path
     elapsed = time.time() - t0
 
     # ── Save raw log ──────────────────────────────────────────────────────────
