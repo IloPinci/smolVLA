@@ -1,4 +1,3 @@
-
 """
 finetune.py
 -----------
@@ -58,30 +57,18 @@ def validate_dataset(dataset_dir: Path):
 
 def find_lerobot_train():
     """
-    Locate the lerobot_train.py script.
-    Tries the installed package location first, then common fallback paths.
+    Return the dotted module path for lerobot_train so it can be invoked
+    with `python -m lerobot.scripts.lerobot_train` (required because
+    lerobot_train.py uses relative imports).
     """
     result = subprocess.run(
-        ["python", "-c",
-         "import lerobot, os; "
-         "print(os.path.join(os.path.dirname(lerobot.__file__), 'scripts', 'lerobot_train.py'))"],
+        ["python", "-c", "import lerobot.scripts.lerobot_train"],
         capture_output=True, text=True,
     )
     if result.returncode == 0:
-        candidate = Path(result.stdout.strip())
-        if candidate.exists():
-            return str(candidate)
+        return "lerobot.scripts.lerobot_train"
 
-    # Fallback paths
-    for p in [
-        Path(__file__).parent / "lerobot" / "scripts" / "lerobot_train.py",
-        Path.home() / "lerobot" / "src" / "lerobot" / "scripts" / "lerobot_train.py",
-        Path("/workspace/lerobot/src/lerobot/scripts/lerobot_train.py"),
-    ]:
-        if p.exists():
-            return str(p)
-
-    print("[error] Cannot find lerobot/scripts/lerobot_train.py.")
+    print("[error] Cannot import lerobot.scripts.lerobot_train.")
     print("        Make sure lerobot is installed:  pip install -e '.[smolvla]'")
     sys.exit(1)
 
@@ -158,7 +145,7 @@ def build_command(train_script: str, args) -> list[str]:
     device = "cpu" if args.cpu else "cuda"
 
     cmd = [
-        sys.executable, train_script,
+        sys.executable, "-m", module,
         # draccus overrides — NO leading "--"
         f"policy.pretrained_path=lerobot/smolvla_base",
         f"dataset.repo_id=local/genesis_pickplace",
