@@ -148,6 +148,7 @@ def build_command(args) -> list[str]:
         sys.executable, "-m", "lerobot.scripts.lerobot_train",
         "--policy.pretrained_path", "lerobot/smolvla_base",
         "--policy.type", "smolvla",
+        "--policy.push_to_hub", "false",
         "--dataset.repo_id", "local/genesis_pickplace",
         "--dataset.root", str(dataset_dir),
         "--output_dir", args.out_dir,
