@@ -157,7 +157,7 @@ def build_command(train_script: str, args) -> list[str]:
     device = "cpu" if args.cpu else "cuda"
 
     cmd = [
-        sys.executable, train_script,
+        sys.executable, "-m", "lerobot.scripts.lerobot_train",
         # draccus overrides — NO leading "--"
         f"policy.pretrained_path=lerobot/smolvla_base",
         f"dataset.repo_id=local/genesis_pickplace",
