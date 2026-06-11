@@ -98,9 +98,9 @@ def plot_tsr(records, out_dir):
 def plot_subgoals(records, out_dir):
     n = len(records)
     rates = {
-        "Reached\nblock":  sum(r["reached"] for r in records) / n,
-        "Lifted\nblock":   sum(r["lifted"]  for r in records) / n,
-        "Placed\non target": sum(r["placed"] for r in records) / n,
+        "Reached": sum(r["reached"] for r in records) / n,
+        "Lifted":  sum(r["lifted"]  for r in records) / n,
+        "Placed":  sum(r["placed"]  for r in records) / n,
     }
     colors = [GREEN, AMBER, BLUE]
 
@@ -215,9 +215,9 @@ def write_summary(records, tsr, lo, hi, sg_rates, out_dir):
         f"  Mean PSS            : {mean_pss:.3f}",
         "",
         "  Sub-goal completion:",
-        f"    Reached block     : {sg_rates['Reached\\nblock']:.1%}",
-        f"    Lifted block      : {sg_rates['Lifted\\nblock']:.1%}",
-        f"    Placed on target  : {sg_rates['Placed\\non target']:.1%}",
+        f"    Reached block     : {sg_rates['Reached']:.1%}",
+        f"    Lifted block      : {sg_rates['Lifted']:.1%}",
+        f"    Placed on target  : {sg_rates['Placed']:.1%}",
         "",
         f"  Mean steps (success): {mean_steps_success:.0f}",
         f"  Mean steps (fail)   : {mean_steps_fail:.0f}",
