@@ -257,11 +257,12 @@ def main():
         log_lines.append(line)
 
     proc.wait()
+    elapsed = time.time() - t0
     out_dir.mkdir(parents=True, exist_ok=True)
     final_meta_path = out_dir / "finetune_run.json"
     run_meta_path.rename(final_meta_path)
     run_meta_path = final_meta_path
-    elapsed = time.time() - t0
+    
 
     # ── Save raw log ──────────────────────────────────────────────────────────
     log_path = out_dir / "train_log.txt"
