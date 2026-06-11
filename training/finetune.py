@@ -120,7 +120,7 @@ def find_last_checkpoint(out_dir: Path) -> Path | None:
 #  Build training command
 # ══════════════════════════════════════════════════════════════════════════════
 
-def build_command(train_script: str, args) -> list[str]:
+def build_command(module: str, args) -> list[str]:
     """
     Build the draccus/lerobot_train command.
 
