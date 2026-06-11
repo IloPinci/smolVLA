@@ -157,6 +157,7 @@ def build_command(args) -> list[str]:
         "--policy.device", device,
         "--wandb.enable", "true" if args.wandb else "false",
         "--job_name", "smolvla_genesis_finetune",
+        "--resume", "true" if args.resume else "false",
     ]
 
     if args.wandb and args.wandb_project:
@@ -192,6 +193,8 @@ def main():
                         help="W&B project name")
     parser.add_argument("--cpu",           action="store_true",
                         help="Force CPU (for debugging only — very slow)")
+    parser.add_argument("--resume", action="store_true",
+                    help="Resume training if output_dir already exists")
     args = parser.parse_args()
 
     dataset_dir = Path(args.dataset_dir)
