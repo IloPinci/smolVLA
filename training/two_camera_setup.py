@@ -92,7 +92,7 @@ def attach_cameras(scene, so101, table_height,
     # ── Context camera (fixed, world frame) ──────────────────────────────────
 
     # Nominal pose, unchanged from the original hardcoded values.
-    context_pos_nominal    = np.array([0.5, -0.4, table_height + 0.55])
+    context_pos_nominal    = np.array([0.4, -0.4, table_height + 0.55])
     context_lookat_nominal = np.array([0.2, 0.0,  table_height + 0.05])
 
     # context_offset translates the camera position. Default (0,0,0) leaves
