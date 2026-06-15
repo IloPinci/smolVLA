@@ -45,6 +45,7 @@ import numpy as np
 import pandas as pd
 import torch
 from dataclasses import dataclass, field
+from scene_params import language_instruction_for, DEFAULT_CUBE_COLOR
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -56,7 +57,7 @@ STATE_DIM            = 6
 ACTION_DIM           = 6
 CHUNK_SIZE           = 1000        # episodes per chunk folder
 FPS                  = 30          # video frame rate written into the dataset
-LANGUAGE_INSTRUCTION = "Pick up the red block and place it on the green target."
+LANGUAGE_INSTRUCTION = language_instruction_for(DEFAULT_CUBE_COLOR)
 
 # Camera key remap: oracle internal name → LeRobot observation key suffix
 _CAM_REMAP = {
@@ -408,6 +409,7 @@ def _finalise_meta(
     fps: int,
     repo_id: str,
     val_frac: float = 0.1,
+    language_instruction: str = LANGUAGE_INSTRUCTION,
 ):
     """
     Write meta/info.json, meta/episodes.jsonl, meta/tasks.jsonl after all
@@ -423,7 +425,7 @@ def _finalise_meta(
 
     # tasks.jsonl
     with open(meta_dir / "tasks.jsonl", "w") as f:
-        f.write(json.dumps({"task_index": 0, "task": LANGUAGE_INSTRUCTION}) + "\n")
+        f.write(json.dumps({"task_index": 0, "task": language_instruction}) + "\n")
 
     # episodes.jsonl
     with open(meta_dir / "episodes.jsonl", "w") as f:
@@ -484,7 +486,7 @@ def _finalise_meta(
         "video_path": "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
         "features":   features,
         "repo_id":    repo_id,
-        "tasks":      [LANGUAGE_INSTRUCTION],
+        "tasks":      [language_instruction],
     }
 
     with open(meta_dir / "info.json", "w") as f:
@@ -515,6 +517,7 @@ def collect_demonstrations(
     val_frac: float     = 0.1,
     repo_id: str        = "local/genesis_pickplace",
     save_failures: bool = True,
+    cube_color: str     = DEFAULT_CUBE_COLOR,
 ) -> list[bool]:
     """
     Run the oracle for n_episodes and write each SUCCESSFUL episode directly
@@ -528,6 +531,8 @@ def collect_demonstrations(
     """
     cfg    = OracleConfig()
     oracle = SO101Oracle(so101, scene, cameras, cfg)
+
+    language_instruction = language_instruction_for(cube_color)
 
     out_dir  = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -614,11 +619,13 @@ def collect_demonstrations(
 
     # ── Finalise meta files ───────────────────────────────────────────────────
     if episodes_meta:
-        _finalise_meta(out_dir, episodes_meta, fps, repo_id, val_frac)
+        _finalise_meta(out_dir, episodes_meta, fps, repo_id, val_frac,
+                       language_instruction=language_instruction)
 
     if save_failures and fail_episodes_meta:
         _finalise_meta(fail_dir, fail_episodes_meta, fps,
-                       repo_id + "_failures", val_frac=0.0)
+                       repo_id + "_failures", val_frac=0.0,
+                       language_instruction=language_instruction)
 
     # ── Summary ───────────────────────────────────────────────────────────────
     print(f"\n{'─' * 50}")

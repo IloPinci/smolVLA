@@ -3,13 +3,14 @@ import numpy as np
 import genesis as gs
 import torch
 from oracle_direct import SO101Oracle, OracleConfig, collect_demonstrations
+from scene_params import CUBE_COLORS, DEFAULT_CUBE_COLOR, IMG_RES
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Environment
 # ══════════════════════════════════════════════════════════════════════════════
 
-def build_environment(scene, table_height):
+def build_environment(scene, table_height, cube_color: str = DEFAULT_CUBE_COLOR):
     table_width       = 1.0
     table_depth       = 1.0
     surface_thickness = 0.05
@@ -36,7 +37,8 @@ def build_environment(scene, table_height):
                 )
             )
 
-    # Red cube
+    # Cube — color is parameterised (defaults to red)
+    cube_rgb = CUBE_COLORS.get(cube_color, CUBE_COLORS[DEFAULT_CUBE_COLOR])["rgb"]
     cube = scene.add_entity(
         gs.morphs.Box(
             size=(0.03, 0.03, 0.03),
@@ -48,7 +50,7 @@ def build_environment(scene, table_height):
             coup_friction=1.5,
             coup_softness=0.0001,
         ),
-        surface=gs.surfaces.Rough(color=(1.0, 0.0, 0.0)),
+        surface=gs.surfaces.Rough(color=cube_rgb),
     )
 
     # Target zone — visual only, no collision
@@ -70,7 +72,9 @@ def build_environment(scene, table_height):
 #  Cameras
 # ══════════════════════════════════════════════════════════════════════════════
 
-def attach_cameras(scene, so101, table_height):
+def attach_cameras(scene, so101, table_height,
+                    context_offset: tuple[float, float, float] = (0.0, 0.0, 0.0),
+                    context_tilt_deg: float = 0.0):
     """
     Two cameras that match the SmolVLA training distribution:
 
@@ -86,17 +90,42 @@ def attach_cameras(scene, so101, table_height):
     """
 
     # ── Context camera (fixed, world frame) ──────────────────────────────────
+
+    # Nominal pose, unchanged from the original hardcoded values.
+    context_pos_nominal    = np.array([0.5, -0.4, table_height + 0.55])
+    context_lookat_nominal = np.array([0.2, 0.0,  table_height + 0.05])
+
+    # context_offset translates the camera position. Default (0,0,0) leaves
+    # pos exactly at the nominal value.
+    context_pos = context_pos_nominal + np.array(context_offset, dtype=float)
+
+   # context_tilt_deg rotates the LOOK DIRECTION (about world Z) from the
+    # (possibly offset) camera position. Default 0.0 leaves the look target
+    # at the nominal point, so pos==nominal + tilt==0 reproduces the
+    # original camera exactly.
+    if context_tilt_deg:
+        look_vec = context_lookat_nominal - context_pos_nominal
+        theta = np.radians(context_tilt_deg)
+        c, s = np.cos(theta), np.sin(theta)
+        rot_z = np.array([[c, -s, 0.0],
+                          [s,  c, 0.0],
+                          [0.0, 0.0, 1.0]])
+        look_vec = rot_z @ look_vec
+        context_lookat = context_pos + look_vec
+    else:
+        context_lookat = context_lookat_nominal
+
     context_cam = scene.add_camera(
-        res=(256, 256),
-        pos=(0.5, -0.4, table_height + 0.55),   # front-right, slightly above table
-        lookat=(0.2, 0.0, table_height + 0.05),  # looking at the workspace centre
+        res=IMG_RES,
+        pos=tuple(context_pos),
+        lookat=tuple(context_lookat),
         fov=60,
         GUI=False,
     )
     
     #! Camera top — fixed, world frame, not rendered yet but ready to use
     top_cam = scene.add_camera(
-        res=(256, 256),
+        res=IMG_RES,
         pos=(0.0, 0.0, table_height + 1.0),
         lookat=(0.0, 0.0, table_height + 0.1),
         fov=65,
@@ -106,7 +135,7 @@ def attach_cameras(scene, so101, table_height):
     # ── Wrist camera (attached to gripper link) ───────────────────────────────
     # We create the camera at a dummy world position; attach() overrides it.
     wrist_cam = scene.add_camera(
-        res=(256, 256),
+        res=IMG_RES,
         pos=(0.0, 0.0, 0.0),   # placeholder — will be overridden by attach()
         lookat=(1.0, 0.0, 0.0),
         fov=50,

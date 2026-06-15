@@ -24,6 +24,8 @@ import imageio.v3 as iio
 import numpy as np
 import torch
 from transformers import AutoTokenizer
+from scene_params import IMG_RES, language_instruction_for, DEFAULT_CUBE_COLOR
+
 
 # ── Genesis ───────────────────────────────────────────────────────────────────
 import genesis as gs
@@ -59,8 +61,7 @@ check_sub_goals    = _setup.check_sub_goals
 #  Language instruction (must match your dataset)
 # ══════════════════════════════════════════════════════════════════════════════
 
-LANGUAGE_INSTRUCTION = "Pick up the red block and place it on the green target."
-
+LANGUAGE_INSTRUCTION = language_instruction_for(DEFAULT_CUBE_COLOR)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Policy wrapper
@@ -84,7 +85,8 @@ class SmolVLAAgent:
         self.policy.reset()
 
     @torch.no_grad()
-    def act(self, context_rgb: np.ndarray, wrist_rgb: np.ndarray, top_rgb: np.ndarray, joint_state: np.ndarray) -> np.ndarray:
+    def act(self, context_rgb: np.ndarray, wrist_rgb: np.ndarray, top_rgb: np.ndarray,
+            joint_state: np.ndarray, language_instruction: str = LANGUAGE_INSTRUCTION) -> np.ndarray:
         """
         Parameters
         ----------
@@ -107,7 +109,7 @@ class SmolVLAAgent:
 
         # Tokenize the language instruction
         enc = self.tokenizer(
-            [LANGUAGE_INSTRUCTION],
+            [language_instruction],
             return_tensors="pt",
             padding=True,
             truncation=True,

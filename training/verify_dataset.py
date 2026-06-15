@@ -15,6 +15,7 @@ import os
 import random
 import sys
 from pathlib import Path
+from scene_params import IMG_RES
 
 import h5py
 import numpy as np
@@ -45,7 +46,7 @@ EXPECTED_DATASETS = {
     "meta/language_instruction":       {"dtype": None,      "ndim": 0},
 }
 
-IMG_SHAPE   = (256, 256, 3)
+IMG_SHAPE   = IMG_RES + (3,)
 STATE_DIM   = 6
 ACTION_DIM  = 6
 MIN_FRAMES  = 20   # any episode shorter than this is probably corrupt
