@@ -148,29 +148,28 @@ def build_command(args) -> list[str]:
     dataset_dir = Path(args.dataset_dir).resolve()
     device      = "cpu" if args.cpu else "cuda"
 
-    # FIX: draccus expects bare `key=value` positional args, NOT `--key value`.
     cmd = [
         sys.executable, "-m", "lerobot.scripts.lerobot_train",
-        f"policy.pretrained_path=lerobot/smolvla_base",
-        f"policy.type=smolvla",
-        f"policy.push_to_hub=false",
-        f"dataset.repo_id=local/genesis_pickplace",
-        f"dataset.root={dataset_dir}",
-        f"output_dir={args.out_dir}",
-        f"steps={args.steps}",
-        f"batch_size={args.batch_size}",
-        f"save_freq={args.save_freq}",
-        f"policy.device={device}",
-        f"wandb.enable={'true' if args.wandb else 'false'}",
-        f"job_name=smolvla_genesis_finetune",
-        f"resume={'true' if args.resume else 'false'}",
+        f"--policy.pretrained_path=lerobot/smolvla_base",
+        f"--policy.type=smolvla",
+        f"--policy.push_to_hub=false",
+        f"--dataset.repo_id=local/genesis_pickplace",
+        f"--dataset.root={dataset_dir}",
+        f"--output_dir={args.out_dir}",
+        f"--steps={args.steps}",
+        f"--batch_size={args.batch_size}",
+        f"--save_freq={args.save_freq}",
+        f"--policy.device={device}",
+        f"--wandb.enable={'true' if args.wandb else 'false'}",
+        f"--job_name=smolvla_genesis_finetune",
+        f"--resume={'true' if args.resume else 'false'}",
     ]
 
     if args.wandb and args.wandb_project:
-        cmd.append(f"wandb.project={args.wandb_project}")
+        cmd.append(f"--wandb.project={args.wandb_project}")
 
     if args.eval_freq:
-        cmd.append(f"eval_freq={args.eval_freq}")
+        cmd.append(f"--eval_freq={args.eval_freq}")
 
     return cmd
 
