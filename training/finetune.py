@@ -57,9 +57,9 @@ def validate_dataset(dataset_dir: Path):
 
 def find_lerobot_train():
     """
-    Return the dotted module path for lerobot_train so it can be invoked
-    with `python -m lerobot.scripts.lerobot_train` (required because
-    lerobot_train.py uses relative imports).
+    Verify lerobot_train is importable and return its module path.
+    lerobot 0.5.x uses draccus (dataclass-based config) — overrides must be
+    passed as positional `key=value` args, NOT `--key value`.
     """
     result = subprocess.run(
         ["python", "-c", "import lerobot.scripts.lerobot_train"],
@@ -122,15 +122,18 @@ def find_last_checkpoint(out_dir: Path) -> Path | None:
 
 def build_command(args) -> list[str]:
     """
-    Build the draccus/lerobot_train command.
+    Build the draccus/lerobot_train command for lerobot 0.5.x.
 
-    LeRobot v0.5.x uses draccus (dataclass-based config), NOT argparse.
+    IMPORTANT: lerobot 0.5.x uses draccus (dataclass-based config), NOT argparse.
     Overrides are passed as positional `key=value` arguments — NO leading `--`.
+    Using `--key value` (argparse style) will cause draccus to silently ignore
+    the overrides or raise an unrecognised-argument error.
 
-    Key mapping (verified against TrainPipelineConfig + sub-configs):
-      policy.pretrained_path  ← PreTrainedConfig.pretrained_path  (NOT .path)
+    Key mapping (verified against lerobot 0.5.x TrainPipelineConfig):
+      policy.pretrained_path  ← PreTrainedConfig.pretrained_path
+      policy.type             ← which policy class to instantiate
       dataset.repo_id         ← DatasetConfig.repo_id
-      dataset.root            ← DatasetConfig.root                (NOT .local_dir)
+      dataset.root            ← DatasetConfig.root  (local path, no Hub download)
       output_dir              ← TrainPipelineConfig.output_dir
       steps                   ← TrainPipelineConfig.steps
       batch_size              ← TrainPipelineConfig.batch_size
@@ -140,32 +143,34 @@ def build_command(args) -> list[str]:
       wandb.enable            ← WandBConfig.enable
       wandb.project           ← WandBConfig.project
       job_name                ← TrainPipelineConfig.job_name
+      resume                  ← TrainPipelineConfig.resume
     """
     dataset_dir = Path(args.dataset_dir).resolve()
-    device = "cpu" if args.cpu else "cuda"
+    device      = "cpu" if args.cpu else "cuda"
 
+    # FIX: draccus expects bare `key=value` positional args, NOT `--key value`.
     cmd = [
         sys.executable, "-m", "lerobot.scripts.lerobot_train",
-        "--policy.pretrained_path", "lerobot/smolvla_base",
-        "--policy.type", "smolvla",
-        "--policy.push_to_hub", "false",
-        "--dataset.repo_id", "local/genesis_pickplace",
-        "--dataset.root", str(dataset_dir),
-        "--output_dir", args.out_dir,
-        "--steps", str(args.steps),
-        "--batch_size", str(args.batch_size),
-        "--save_freq", str(args.save_freq),
-        "--policy.device", device,
-        "--wandb.enable", "true" if args.wandb else "false",
-        "--job_name", "smolvla_genesis_finetune",
-        "--resume", "true" if args.resume else "false",
+        f"policy.pretrained_path=lerobot/smolvla_base",
+        f"policy.type=smolvla",
+        f"policy.push_to_hub=false",
+        f"dataset.repo_id=local/genesis_pickplace",
+        f"dataset.root={dataset_dir}",
+        f"output_dir={args.out_dir}",
+        f"steps={args.steps}",
+        f"batch_size={args.batch_size}",
+        f"save_freq={args.save_freq}",
+        f"policy.device={device}",
+        f"wandb.enable={'true' if args.wandb else 'false'}",
+        f"job_name=smolvla_genesis_finetune",
+        f"resume={'true' if args.resume else 'false'}",
     ]
 
     if args.wandb and args.wandb_project:
-        cmd += ["--wandb.project", args.wandb_project]
+        cmd.append(f"wandb.project={args.wandb_project}")
 
     if args.eval_freq:
-        cmd += ["--eval_freq", str(args.eval_freq)]
+        cmd.append(f"eval_freq={args.eval_freq}")
 
     return cmd
 
@@ -194,13 +199,12 @@ def main():
                         help="W&B project name")
     parser.add_argument("--cpu",           action="store_true",
                         help="Force CPU (for debugging only — very slow)")
-    parser.add_argument("--resume", action="store_true",
-                    help="Resume training if output_dir already exists")
+    parser.add_argument("--resume",        action="store_true",
+                        help="Resume training if output_dir already exists")
     args = parser.parse_args()
 
     dataset_dir = Path(args.dataset_dir)
     out_dir     = Path(args.out_dir)
-    #out_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Validate dataset ──────────────────────────────────────────────────────
     info = validate_dataset(dataset_dir)
@@ -217,6 +221,7 @@ def main():
     print(f"─────────────────────────────────────────────────────────\n")
 
     # ── Write run metadata (before launch, so it exists even if training crashes)
+    out_dir.parent.mkdir(parents=True, exist_ok=True)
     run_meta = {
         "started_at":      datetime.now().isoformat(),
         "dataset_dir":     str(dataset_dir.resolve()),
@@ -235,7 +240,7 @@ def main():
         "last_checkpoint": None,
         "n_action_steps_patched": False,
     }
-    run_meta_path = Path(args.out_dir).parent / f"finetune_run_pending.json"
+    run_meta_path = out_dir.parent / "finetune_run_pending.json"
     with open(run_meta_path, "w") as f:
         json.dump(run_meta, f, indent=2)
 
@@ -263,7 +268,6 @@ def main():
     final_meta_path = out_dir / "finetune_run.json"
     run_meta_path.rename(final_meta_path)
     run_meta_path = final_meta_path
-    
 
     # ── Save raw log ──────────────────────────────────────────────────────────
     log_path = out_dir / "train_log.txt"
@@ -293,10 +297,10 @@ def main():
 
     # ── Summary ───────────────────────────────────────────────────────────────
     print(f"\n── Fine-tuning summary ───────────────────────────────────")
-    print(f"  Status        : {'SUCCESS ✓' if proc.returncode == 0 else 'FAILED ✗'}")
-    print(f"  Elapsed       : {elapsed / 60:.1f} min")
+    print(f"  Status          : {'SUCCESS ✓' if proc.returncode == 0 else 'FAILED ✗'}")
+    print(f"  Elapsed         : {elapsed / 60:.1f} min")
     print(f"  Last checkpoint : {last_ckpt}")
-    print(f"  Run metadata  : {run_meta_path}")
+    print(f"  Run metadata    : {run_meta_path}")
     print(f"─────────────────────────────────────────────────────────")
 
     if proc.returncode != 0:

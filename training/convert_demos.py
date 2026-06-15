@@ -96,11 +96,16 @@ def load_episode(path: Path) -> dict | None:
 #  Write one episode
 # ══════════════════════════════════════════════════════════════════════════════
 
-def write_episode(ep_data: dict, ep_idx: int, out_dir: Path, fps: int, task_idx: int = 0):
+def write_episode(ep_data: dict, ep_idx: int, out_dir: Path, fps: int,
+                  global_frame_offset: int, task_idx: int = 0):
     """
     Write one episode's Parquet file and per-camera MP4s.
+
+    global_frame_offset: total frames written before this episode, so that
+    the 'index' column is a monotonically increasing global frame index
+    across the whole dataset (required by lerobot's dataset loader).
     """
-    T    = ep_data["T"]
+    T         = ep_data["T"]
     chunk_str = f"chunk-{ep_idx // CHUNK_SIZE:03d}"
     ep_str    = f"episode_{ep_idx:06d}"
 
@@ -108,35 +113,21 @@ def write_episode(ep_data: dict, ep_idx: int, out_dir: Path, fps: int, task_idx:
     parquet_dir = out_dir / "data" / chunk_str
     parquet_dir.mkdir(parents=True, exist_ok=True)
 
-    timestamps  = np.arange(T, dtype=np.float32) / fps   # seconds
-    frame_idxs  = np.arange(T, dtype=np.int64)
+    timestamps  = np.arange(T, dtype=np.float32) / fps          # seconds
+    frame_idxs  = np.arange(T, dtype=np.int64)                  # per-episode 0…T-1
+    # FIX: global index must be unique across ALL episodes, not reset per episode
+    global_idxs = np.arange(global_frame_offset,
+                             global_frame_offset + T, dtype=np.int64)
 
-    rows = {
-        "timestamp":    timestamps,
-        "frame_index":  frame_idxs,
-        "episode_index": np.full(T, ep_idx, dtype=np.int64),
-        "task_index":   np.full(T, task_idx, dtype=np.int64),
-        "index":        frame_idxs,   # global step index (filled in meta later)
-    }
-
-    # State columns
-    for i in range(STATE_DIM):
-        rows[f"observation.state.{i}"] = ep_data["state"][:, i]
-
-    # Action columns
-    for i in range(ACTION_DIM):
-        rows[f"action.{i}"] = ep_data["action"][:, i]
-
-    # Pack state and action as list-columns (LeRobot v2.1 expects array columns)
     df = pd.DataFrame({
-        "timestamp":     timestamps,
-        "frame_index":   frame_idxs,
-        "episode_index": np.full(T, ep_idx, dtype=np.int64),
-        "task_index":    np.full(T, task_idx, dtype=np.int64),
-        "index":         frame_idxs,
+        "timestamp":         timestamps,
+        "frame_index":       frame_idxs,
+        "episode_index":     np.full(T, ep_idx, dtype=np.int64),
+        "task_index":        np.full(T, task_idx, dtype=np.int64),
+        "index":             global_idxs,          # ← global, not per-episode
         "observation.state": list(ep_data["state"]),    # list of float32 arrays
-        "action":             list(ep_data["action"]),   # list of float32 arrays
-        "next.done":     np.concatenate([np.zeros(T - 1, dtype=bool), [True]]),
+        "action":            list(ep_data["action"]),   # list of float32 arrays
+        "next.done":         np.concatenate([np.zeros(T - 1, dtype=bool), [True]]),
     })
     df.to_parquet(parquet_dir / f"{ep_str}.parquet", index=False)
 
@@ -169,9 +160,9 @@ def write_meta(out_dir: Path, episodes_meta: list[dict], fps: int,
     meta_dir = out_dir / "meta"
     meta_dir.mkdir(parents=True, exist_ok=True)
 
-    n_eps   = len(episodes_meta)
-    n_val   = max(1, int(math.floor(n_eps * val_frac)))
-    n_train = n_eps - n_val
+    n_eps        = len(episodes_meta)
+    n_val        = max(1, int(math.floor(n_eps * val_frac)))
+    n_train      = n_eps - n_val
     total_frames = sum(e["length"] for e in episodes_meta)
 
     # ── tasks.jsonl ──────────────────────────────────────────────────────────
@@ -184,6 +175,8 @@ def write_meta(out_dir: Path, episodes_meta: list[dict], fps: int,
             f.write(json.dumps(e) + "\n")
 
     # ── info.json ────────────────────────────────────────────────────────────
+    # Read actual image shape from the first parquet/video rather than hardcoding,
+    # but default to 256x256 if we can't determine it.
     H, W = 256, 256
 
     features = {
@@ -211,16 +204,17 @@ def write_meta(out_dir: Path, episodes_meta: list[dict], fps: int,
             "shape":   [H, W, 3],
             "names":   ["height", "width", "channel"],
             "video_info": {
-                "video.fps":              float(fps),
-                "video.codec":            "h264",
-                "video.pix_fmt":          "yuv420p",
-                "video.is_depth_map":     False,
-                "has_audio":              False,
+                "video.fps":          float(fps),
+                "video.codec":        "h264",
+                "video.pix_fmt":      "yuv420p",
+                "video.is_depth_map": False,
+                "has_audio":          False,
             },
         }
 
     info = {
-        "codebase_version":  "v3.0",
+        # FIX: lerobot 0.5.x expects "v2.1", not "v3.0"
+        "codebase_version":  "v2.1",
         "robot_type":        "so101",
         "total_episodes":    n_eps,
         "total_frames":      total_frames,
@@ -233,11 +227,11 @@ def write_meta(out_dir: Path, episodes_meta: list[dict], fps: int,
             "train": f"0:{n_train}",
             "val":   f"{n_train}:{n_eps}",
         },
-        "data_path":         "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
-        "video_path":        "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
-        "features":          features,
-        "repo_id":           repo_id,
-        "tasks":             [lang],
+        "data_path":  "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
+        "video_path": "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
+        "features":   features,
+        "repo_id":    repo_id,
+        "tasks":      [lang],
     }
 
     with open(meta_dir / "info.json", "w") as f:
@@ -261,7 +255,7 @@ def main():
     parser.add_argument("--hdf5_dir", default="demos/baseline/",
                         help="Directory containing episode_*.hdf5 files")
     parser.add_argument("--out_dir",  default="demos/lerobot/",
-                        help="Output directory for LeRobot v3.0 dataset")
+                        help="Output directory for LeRobot v2.1 dataset")
     parser.add_argument("--fps",      type=int, default=30,
                         help="Frame rate for video encoding")
     parser.add_argument("--val_frac", type=float, default=0.2,
@@ -292,9 +286,10 @@ def main():
             return
 
     # ── Convert episodes ──────────────────────────────────────────────────────
-    episodes_meta = []
-    lang          = None
-    ep_idx        = 0
+    episodes_meta       = []
+    lang                = None
+    ep_idx              = 0
+    global_frame_offset = 0   # running total of frames written so far
 
     for hdf5_path in hdf5_files:
         print(f"  Converting {hdf5_path.name} → episode {ep_idx:06d} …", end=" ")
@@ -306,7 +301,8 @@ def main():
         if lang is None:
             lang = ep_data["lang"]
 
-        write_episode(ep_data, ep_idx, out_dir, args.fps)
+        write_episode(ep_data, ep_idx, out_dir, args.fps,
+                      global_frame_offset=global_frame_offset)
 
         episodes_meta.append({
             "episode_index": ep_idx,
@@ -315,7 +311,8 @@ def main():
         })
 
         print(f"T={ep_data['T']}  success={ep_data['success']}")
-        ep_idx += 1
+        global_frame_offset += ep_data["T"]
+        ep_idx              += 1
 
     if ep_idx == 0:
         print("[error] No episodes were converted successfully.")
