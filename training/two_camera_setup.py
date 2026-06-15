@@ -2,7 +2,7 @@ import os
 import numpy as np
 import genesis as gs
 import torch
-from oracle_direct import SO101Oracle, OracleConfig, collect_demonstrations
+from oracle import SO101Oracle, OracleConfig, collect_demonstrations
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -304,9 +304,7 @@ def main():
         is_success_fn=success_fn,
         check_sub_goals_fn=sub_goals_fn,
         n_episodes=200,
-        output_dir="demos/lerobot/",
-        fps=30,
-        repo_id="local/genesis_pickplace",
+        output_dir="demos/baseline/",
     )
 
 
