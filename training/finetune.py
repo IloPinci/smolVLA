@@ -163,6 +163,7 @@ def build_command(args) -> list[str]:
         f"--wandb.enable={'true' if args.wandb else 'false'}",
         f"--job_name=smolvla_genesis_finetune",
         f"--resume={'true' if args.resume else 'false'}",
+        f"--tolerance_s=1e-3", 
     ]
 
     if args.wandb and args.wandb_project:

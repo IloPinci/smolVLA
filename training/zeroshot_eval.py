@@ -303,6 +303,16 @@ def run_rollout(agent, scene, so101, cube, target_zone,
         # ── Policy inference ──────────────────────────────────────────────────
         action = agent.act(ctx_rgb, wrist_rgb, top_rgb, qpos[:6])  # [7]
 
+        # ── DEBUG (remove after diagnosis) ───────────────────────────────────
+        if step < 5:
+            print(f"\n[DEBUG step {step}]")
+            print(f"  qpos now     = {qpos[:6].round(3)}")
+            print(f"  raw action   = {action.round(3)}")
+            print(f"  arm_target   = {(qpos[:5] + action[:5]).round(3)}")
+            print(f"  gripper_tgt  = {action[5]:.4f}")
+            print(f"  ctx_rgb mean = {ctx_rgb.mean():.1f}  wrist mean = {wrist_rgb.mean():.1f}")
+
+
         # ── Apply action ──────────────────────────────────────────────────────
         # Arm: current + delta
         arm_target     = qpos[:5] + action[:5]
