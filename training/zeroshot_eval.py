@@ -230,7 +230,7 @@ def reset_episode(scene, so101, cube, target_zone, table_height, rng):
 #  Run one rollout
 # ══════════════════════════════════════════════════════════════════════════════
 
-MAX_STEPS    = 3000   # 30 sim-seconds at dt=0.01
+MAX_STEPS    = 300   # 30 sim-seconds at dt=0.01
 ARM_DOFS     = np.arange(5)
 GRIPPER_DOF  = np.array([5])
 RECORD_EVERY = 5   # save 1 frame per 5 steps → ~600 frames max per episode
@@ -319,9 +319,13 @@ def run_rollout(agent, scene, so101, cube, target_zone,
         # Gripper: absolute position from action[5]
         gripper_target = np.array([action[5]])
 
-        so101.control_dofs_position(arm_target,     dofs_idx_local=arm_dofs)
-        so101.control_dofs_position(gripper_target, dofs_idx_local=gripper_dof)
-        scene.step()
+
+        HOLD_STEPS = 10
+
+        for _ in range(HOLD_STEPS):
+            so101.control_dofs_position(arm_target,     dofs_idx_local=arm_dofs)
+            so101.control_dofs_position(gripper_target, dofs_idx_local=gripper_dof)
+            scene.step()
 
         # Record frames every N steps
         if step % RECORD_EVERY == 0:

@@ -334,7 +334,7 @@ def main():
         check_sub_goals_fn=sub_goals_fn,
         n_episodes=200,
         output_dir="demos/lerobot/",
-        fps=30,
+        fps=10,
         repo_id="local/genesis_pickplace",
     )
 

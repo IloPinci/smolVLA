@@ -129,6 +129,7 @@ class SO101Oracle:
                     is_success_fn, check_sub_goals_fn) -> bool:
         self._frames     = []
         self._last_qpos  = None
+        self._step_counter = 0 
         self._subgoal_latch: dict = {"lifted": False}
 
         cube_pos   = cube.get_pos().cpu().numpy()
@@ -177,8 +178,13 @@ class SO101Oracle:
 
     # ── Frame recording ────────────────────────────────────────────────────
 
-    def _record_step(self, qpos: torch.Tensor):
+    def _record_step(self, qpos: torch.Tensor, step_counter: int = 0):
         if self.cameras is None:
+            return
+        
+        # Only record every 10th sim step
+        if step_counter % 10 != 0:
+            self._last_qpos = qpos.clone()
             return
 
         frame = {}
@@ -191,9 +197,7 @@ class SO101Oracle:
             frame[f"observation.images.{remapped_key}"] = rgb
 
         frame["observation.state"] = qpos[:6].cpu().numpy().astype(np.float32)
-
-        # ABSOLUTE positions for all 6 channels, not deltas
-        frame["action"] = qpos[:6].cpu().numpy().astype(np.float32)
+        frame["action"] = qpos[:6].cpu().numpy().astype(np.float32)  # absolute, not delta
 
         self._last_qpos = qpos.clone()
         self._frames.append(frame)
@@ -226,7 +230,8 @@ class SO101Oracle:
             self.robot.control_dofs_position(qpos[_ARM_DOFS],    dofs_idx_local=_ARM_DOFS)
             self.robot.control_dofs_position(qpos[_GRIPPER_DOF], dofs_idx_local=_GRIPPER_DOF)
             self.scene.step()
-            self._record_step(qpos)
+            self._record_step(qpos, self._step_counter)
+            self._step_counter += 1  
             return check_sub_goals_fn(
                 self.robot, cube, target_zone, table_height, latch
             )["placed"]
@@ -268,13 +273,15 @@ class SO101Oracle:
             self.robot.control_dofs_position(interp_qpos[_ARM_DOFS],    dofs_idx_local=_ARM_DOFS)
             self.robot.control_dofs_position(interp_qpos[_GRIPPER_DOF], dofs_idx_local=_GRIPPER_DOF)
             self.scene.step()
-            self._record_step(interp_qpos)
+            self._record_step(interp_qpos, self._step_counter)
+            self._step_counter += 1
 
         for _ in range(15):
             self.robot.control_dofs_position(closed_qpos[_ARM_DOFS],    dofs_idx_local=_ARM_DOFS)
             self.robot.control_dofs_position(closed_qpos[_GRIPPER_DOF], dofs_idx_local=_GRIPPER_DOF)
             self.scene.step()
-            self._record_step(closed_qpos)
+            self._record_step(closed_qpos, self._step_counter)
+            self._step_counter += 1
 
         open_qpos    = closed_qpos.clone()
         open_qpos[5] = cfg.gripper_open
@@ -283,13 +290,15 @@ class SO101Oracle:
             self.robot.control_dofs_position(open_qpos[_ARM_DOFS],    dofs_idx_local=_ARM_DOFS)
             self.robot.control_dofs_position(open_qpos[_GRIPPER_DOF], dofs_idx_local=_GRIPPER_DOF)
             self.scene.step()
-            self._record_step(open_qpos)
+            self._record_step(open_qpos, self._step_counter)
+            self._step_counter += 1
 
         for _ in range(settle_steps):
             self.robot.control_dofs_position(open_qpos[_ARM_DOFS],    dofs_idx_local=_ARM_DOFS)
             self.robot.control_dofs_position(open_qpos[_GRIPPER_DOF], dofs_idx_local=_GRIPPER_DOF)
             self.scene.step()
-            self._record_step(open_qpos)
+            self._record_step(open_qpos, self._step_counter)
+            self._step_counter += 1
 
         return is_success_fn(cube, target_zone, table_height)
 
