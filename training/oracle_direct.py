@@ -178,31 +178,26 @@ class SO101Oracle:
     # ── Frame recording ────────────────────────────────────────────────────
 
     def _record_step(self, qpos: torch.Tensor):
-        """Capture one observation+action frame."""
         if self.cameras is None:
             return
 
         frame = {}
-
         ATTACHED_CAM_KEYS = {"wrist"}
         for key, cam in self.cameras.items():
             if key in ATTACHED_CAM_KEYS:
                 cam.move_to_attach()
             rgb, _, _, _ = cam.render()
             remapped_key = _CAM_REMAP.get(key, key)
-            frame[f"observation.images.{remapped_key}"] = rgb   # uint8 [H,W,3]
+            frame[f"observation.images.{remapped_key}"] = rgb
 
         frame["observation.state"] = qpos[:6].cpu().numpy().astype(np.float32)
 
-        truly_prev = self._last_qpos if self._last_qpos is not None else qpos
-        delta      = (qpos - truly_prev).cpu().numpy().astype(np.float32)
-        # action: 5 arm deltas + 1 absolute gripper position
-        action = np.concatenate([delta[:5], [qpos[5].item()]])
-        frame["action"] = action
+        # ABSOLUTE positions for all 6 channels, not deltas
+        frame["action"] = qpos[:6].cpu().numpy().astype(np.float32)
 
         self._last_qpos = qpos.clone()
         self._frames.append(frame)
-
+    
     # ── Segment execution ──────────────────────────────────────────────────
 
     def _execute_segment(self, target_cart_pos, gripper_target, settle_steps,

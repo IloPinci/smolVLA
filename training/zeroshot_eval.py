@@ -314,8 +314,8 @@ def run_rollout(agent, scene, so101, cube, target_zone,
 
 
         # ── Apply action ──────────────────────────────────────────────────────
-        # Arm: current + delta
-        arm_target     = qpos[:5] + action[:5]
+        # Arm: current absolute without delta
+        arm_target     = action[:5]
         # Gripper: absolute position from action[5]
         gripper_target = np.array([action[5]])
 
