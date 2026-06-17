@@ -230,7 +230,8 @@ def reset_episode(scene, so101, cube, target_zone, table_height, rng):
 #  Run one rollout
 # ══════════════════════════════════════════════════════════════════════════════
 
-MAX_STEPS    = 300   # 30 sim-seconds at dt=0.01
+MAX_STEPS    = 50       # ~30 frames per oracle episode; 50 gives slight extra margin
+HOLD_STEPS   = 10   # must match oracle's record_every_n_steps
 ARM_DOFS     = np.arange(5)
 GRIPPER_DOF  = np.array([5])
 RECORD_EVERY = 5   # save 1 frame per 5 steps → ~600 frames max per episode
@@ -292,56 +293,33 @@ def run_rollout(agent, scene, so101, cube, target_zone,
     vid_top     = []
 
     while step < MAX_STEPS:
-        # ── Render observations ───────────────────────────────────────────────
-        wrist_cam.move_to_attach()
+        # ── Render — match oracle's per-camera attach-then-render order ───────
         ctx_rgb,   _, _, _ = context_cam.render()
+        wrist_cam.move_to_attach()               # immediately before wrist render
         wrist_rgb, _, _, _ = wrist_cam.render()
         top_rgb,   _, _, _ = top_cam.render()
 
-        qpos = so101.get_dofs_position().cpu().numpy()    # [6]
+        qpos   = so101.get_dofs_position().cpu().numpy()
+        action = agent.act(ctx_rgb, wrist_rgb, top_rgb, qpos[:6])
 
-        # ── Policy inference ──────────────────────────────────────────────────
-        action = agent.act(ctx_rgb, wrist_rgb, top_rgb, qpos[:6])  # [7]
-
-        # ── DEBUG (remove after diagnosis) ───────────────────────────────────
-        if step < 5:
-            print(f"\n[DEBUG step {step}]")
-            print(f"  qpos now     = {qpos[:6].round(3)}")
-            print(f"  raw action   = {action.round(3)}")
-            print(f"  arm_target   = {(qpos[:5] + action[:5]).round(3)}")
-            print(f"  gripper_tgt  = {action[5]:.4f}")
-            print(f"  ctx_rgb mean = {ctx_rgb.mean():.1f}  wrist mean = {wrist_rgb.mean():.1f}")
-
-
-        # ── Apply action ──────────────────────────────────────────────────────
-        # Arm: current absolute without delta
+        # ── Apply — absolute positions, 10 sim steps each ─────────────────────
         arm_target     = action[:5]
-        # Gripper: absolute position from action[5]
         gripper_target = np.array([action[5]])
-
-
-        HOLD_STEPS = 10
-
         for _ in range(HOLD_STEPS):
             so101.control_dofs_position(arm_target,     dofs_idx_local=arm_dofs)
             so101.control_dofs_position(gripper_target, dofs_idx_local=gripper_dof)
             scene.step()
 
-        # Record frames every N steps
-        if step % RECORD_EVERY == 0:
-            vid_context.append(ctx_rgb.copy())
-            vid_wrist.append(wrist_rgb.copy())
-            vid_top.append(top_rgb.copy())
-
-        # ── Sub-goal tracking ─────────────────────────────────────────────────
+        # ── Sub-goals — latch reached just like oracle latches lifted ─────────
         sg = check_sub_goals(so101, cube, target_zone, table_height, _latch=latch)
-        reached = reached or sg["near_block"]
-        lifted  = lifted  or sg["lifted"]
+        if sg["near_block"]:
+            latch["reached"] = True
+        reached = latch["reached"]
+        lifted  = latch["lifted"]
         placed  = sg["placed"]
 
         if placed:
             break
-
         step += 1
 
     success = is_success(cube, target_zone, table_height)
