@@ -156,6 +156,26 @@ def main():
     print("  " + " \\\n    ".join(cmd))
     print(f"─────────────────────────────────────────────────────────\n")
 
+
+    # ── Launch ────────────────────────────────────────────────────────────────
+    print("[info] Launching lerobot-train …\n")
+    t0   = time.time()
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+
+    log_lines = []
+    for line in proc.stdout:
+        print(line, end="", flush=True)
+        log_lines.append(line)
+
+    proc.wait()
+    elapsed = time.time() - t0
+
     # ── Write pending run metadata ────────────────────────────────────────────
     out_dir.mkdir(parents=True, exist_ok=True)
     run_meta = {
@@ -177,28 +197,7 @@ def main():
         "return_code":     None,
         "last_checkpoint": None,
     }
-    pending_path = out_dir / "finetune_run_pending.json"
-    with open(pending_path, "w") as f:
-        json.dump(run_meta, f, indent=2)
 
-    # ── Launch ────────────────────────────────────────────────────────────────
-    print("[info] Launching lerobot-train …\n")
-    t0   = time.time()
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-    )
-
-    log_lines = []
-    for line in proc.stdout:
-        print(line, end="", flush=True)
-        log_lines.append(line)
-
-    proc.wait()
-    elapsed = time.time() - t0
 
     # ── Save log ──────────────────────────────────────────────────────────────
     log_path = out_dir / "train_log.txt"
@@ -208,7 +207,6 @@ def main():
 
     # ── Finalise metadata ─────────────────────────────────────────────────────
     final_path = out_dir / "finetune_run.json"
-    pending_path.rename(final_path)
     last_ckpt = find_last_checkpoint(out_dir)
 
     run_meta.update({
