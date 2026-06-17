@@ -155,12 +155,14 @@ class OracleConfig:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class SO101Oracle:
-    def __init__(self, so101, scene, cameras=None, cfg: OracleConfig = OracleConfig()):
-        self.robot    = so101
-        self.scene    = scene
-        self.cameras  = cameras
-        self.cfg      = cfg
-        self._rng     = np.random.default_rng()
+    def __init__(self, so101, scene, cameras=None, cfg: OracleConfig = OracleConfig(),
+                 language_instruction: str = LANGUAGE_INSTRUCTION):
+        self.robot                = so101
+        self.scene                = scene
+        self.cameras              = cameras
+        self.cfg                  = cfg
+        self.language_instruction = language_instruction   # embedded in every frame dict
+        self._rng                 = np.random.default_rng()
 
         self.end_effector = so101.get_link("moving_jaw_so101_v1")
         self.grasp_quat   = np.array([0.707107, 0.0, -0.707107, 0.0])
@@ -260,6 +262,9 @@ class SO101Oracle:
 
         # Action: absolute joint positions (SmolVLA SO-101 convention)
         frame["action"] = qpos[:6].cpu().numpy().astype(np.float32)
+
+        # Task string — required by LeRobotDataset.add_frame() in v3.0
+        frame["task"] = self.language_instruction
 
         self._frames.append(frame)
 
@@ -440,10 +445,10 @@ def collect_demonstrations(
 
     Returns a list of bool (True = success) per attempted episode.
     """
-    cfg    = OracleConfig()
-    oracle = SO101Oracle(so101, scene, cameras, cfg)
-
+    cfg                  = OracleConfig()
     language_instruction = language_instruction_for(cube_color)
+    # Pass instruction to oracle so it embeds it in every frame dict (required by v3 API)
+    oracle               = SO101Oracle(so101, scene, cameras, cfg, language_instruction)
     features             = make_features(img_h, img_w)
 
     out_dir  = Path(output_dir).resolve()
