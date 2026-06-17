@@ -1,51 +1,66 @@
 """
-oracle_direct.py  —  SO-101 scripted oracle + DIRECT LeRobot v2.1 writer
+oracle_direct.py  —  SO-101 scripted oracle + DIRECT LeRobot v3.0 writer
 =========================================================================
 
-Drop-in replacement for oracle.py that writes episodes DIRECTLY into the
-LeRobot v2.1 parquet + video layout during collection — no convert_demos.py
-step needed.
+Writes episodes DIRECTLY into the LeRobot v3.0 format during collection
+using the official LeRobotDataset API. No convert step, no v2.1 intermediate.
 
-Dataset layout written on the fly:
+Key API flow (v3.0):
+    dataset = LeRobotDataset.create(repo_id, fps, root, features)
+    for each episode:
+        dataset.add_frame(frame_dict)   # called once per timestep
+        dataset.save_episode()          # called at episode end
+    dataset.finalize()                  # MUST be called before push_to_hub
+    dataset.push_to_hub()              # optional — omit for local-only
+
+Dataset layout written on the fly (v3.0 — multi-episode files):
     <output_dir>/
-        data/chunk-000/
-            episode_000000.parquet
-            episode_000001.parquet
-            ...
-        videos/chunk-000/
-            observation.images.camera1/episode_000000.mp4
-            observation.images.camera2/episode_000000.mp4
-            observation.images.camera3/episode_000000.mp4
-            ...
+        data/
+            chunk-000/
+                file-000000.parquet     ← many episodes per file
+        videos/
+            chunk-000/
+                observation.images.camera1/
+                    file-000000.mp4     ← many episodes per file
+                observation.images.camera2/
+                    file-000000.mp4
+                observation.images.camera3/
+                    file-000000.mp4
         meta/
             info.json
-            episodes.jsonl
+            stats.json
             tasks.jsonl
+            episodes/
+                chunk-000/
+                    episode_000000.parquet  ← one row per episode
 
 Usage (identical to before — just swap the import):
     from oracle_direct import SO101Oracle, OracleConfig, collect_demonstrations
 
-Key changes vs oracle.py:
-  - _save_episode_hdf5 is gone; replaced by _write_episode_lerobot()
-  - collect_demonstrations writes parquet + mp4 per episode, then finalises
-    meta/ at the end.
-  - The HDF5 intermediate is never created.
-  - action shape is [T, 6]: first 5 are arm joint DELTAS, index 5 is the
-    ABSOLUTE gripper position — exactly what SmolVLA expects.
+Action format — ABSOLUTE joint positions (6-DOF):
+    action[:5]  — arm joint absolute positions (radians)
+    action[5]   — gripper absolute position
+    This matches SmolVLA's expected input from the SO-101 dataset.
 """
 
-import json
-import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import imageio.v3 as iio
 import numpy as np
-import pandas as pd
 import torch
-from dataclasses import dataclass, field
+
 from scene_params import language_instruction_for, DEFAULT_CUBE_COLOR
+
+# ── LeRobot v3 API ────────────────────────────────────────────────────────────
+try:
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+except ImportError as e:
+    raise ImportError(
+        "lerobot not found. Install from source with SmolVLA extras:\n"
+        "  pip install -e '.[smolvla]'  (inside lerobot repo)\n"
+        f"Original error: {e}"
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -55,8 +70,7 @@ from scene_params import language_instruction_for, DEFAULT_CUBE_COLOR
 CAMERA_KEYS          = ["camera1", "camera2", "camera3"]
 STATE_DIM            = 6
 ACTION_DIM           = 6
-CHUNK_SIZE           = 1000        # episodes per chunk folder
-FPS                  = 30          # video frame rate written into the dataset
+FPS                  = 10          # collect at 10 fps (every 10th sim step at dt=0.01)
 LANGUAGE_INSTRUCTION = language_instruction_for(DEFAULT_CUBE_COLOR)
 
 # Camera key remap: oracle internal name → LeRobot observation key suffix
@@ -68,6 +82,34 @@ _CAM_REMAP = {
 
 _ARM_DOFS    = np.arange(5)
 _GRIPPER_DOF = np.array([5])
+
+# LeRobot v3 features dict — describes every key in each frame dict
+# Shapes match what LeRobotDataset.create() expects.
+# Images: [H, W, C] uint8 — the API handles stacking across time internally.
+def make_features(img_h: int = 256, img_w: int = 256) -> dict:
+    features = {
+        "observation.state": {
+            "dtype": "float32",
+            "shape": (STATE_DIM,),
+            "names": {
+                "motors": [f"motor_{i}" for i in range(STATE_DIM)]
+            },
+        },
+        "action": {
+            "dtype": "float32",
+            "shape": (ACTION_DIM,),
+            "names": {
+                "motors": [f"motor_{i}" for i in range(ACTION_DIM)]
+            },
+        },
+    }
+    for cam_key in CAMERA_KEYS:
+        features[f"observation.images.{cam_key}"] = {
+            "dtype":  "video",
+            "shape":  (img_h, img_w, 3),
+            "names":  ["height", "width", "channel"],
+        }
+    return features
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -94,7 +136,7 @@ class OracleConfig:
     ik_pos_tol: float = 1e-4
     ik_rot_tol: float = 1e-4
 
-    # Settle steps per waypoint
+    # Settle steps per waypoint (sim steps, not recorded frames)
     settle_steps: list = field(default_factory=lambda: [
         10,   # WP0 hover
         50,   # WP1 descend
@@ -104,39 +146,44 @@ class OracleConfig:
         60,   # WP5 release
     ])
 
+    # Record 1 frame every N sim steps (keeps episode length manageable)
+    record_every_n_steps: int = 10
+
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Oracle policy  (unchanged logic from oracle.py)
+#  Oracle policy
 # ══════════════════════════════════════════════════════════════════════════════
 
 class SO101Oracle:
     def __init__(self, so101, scene, cameras=None, cfg: OracleConfig = OracleConfig()):
-        self.robot   = so101
-        self.scene   = scene
-        self.cameras = cameras
-        self.cfg     = cfg
-        self._rng    = np.random.default_rng()
+        self.robot    = so101
+        self.scene    = scene
+        self.cameras  = cameras
+        self.cfg      = cfg
+        self._rng     = np.random.default_rng()
 
         self.end_effector = so101.get_link("moving_jaw_so101_v1")
         self.grasp_quat   = np.array([0.707107, 0.0, -0.707107, 0.0])
 
-        self._frames: list[dict]         = []
-        self._last_qpos: torch.Tensor | None = None
+        self._frames: list[dict]              = []
+        self._last_qpos: torch.Tensor | None  = None
+        self._step_counter: int               = 0
 
     # ── Public API ─────────────────────────────────────────────────────────
 
     def run_episode(self, cube, target_zone, table_height,
                     is_success_fn, check_sub_goals_fn) -> bool:
-        self._frames     = []
-        self._last_qpos  = None
-        self._step_counter = 0 
+        """Run one episode; frame buffer is available via get_recorded_frames()."""
+        self._frames        = []
+        self._last_qpos     = None
+        self._step_counter  = 0
         self._subgoal_latch: dict = {"lifted": False}
 
         cube_pos   = cube.get_pos().cpu().numpy()
         target_pos = target_zone.get_pos().cpu().numpy()
 
         waypoints = self._compute_waypoints(cube_pos, target_pos, table_height)
-        waypoints.insert(2, waypoints[1].copy())
+        waypoints.insert(2, waypoints[1].copy())   # stationary close-gripper WP
 
         gripper_targets = [
             self.cfg.gripper_open,
@@ -174,34 +221,48 @@ class SO101Oracle:
         return success
 
     def get_recorded_frames(self) -> list[dict]:
+        """Return step-by-step frame dicts from the last run_episode call."""
         return self._frames
 
     # ── Frame recording ────────────────────────────────────────────────────
 
-    def _record_step(self, qpos: torch.Tensor, step_counter: int = 0):
+    def _record_step(self, qpos: torch.Tensor):
+        """
+        Capture one frame if cameras are attached and we're on a record step.
+
+        Frame dict keys (matching make_features()):
+            observation.images.camera1  — uint8 [H, W, 3]
+            observation.images.camera2  — uint8 [H, W, 3]
+            observation.images.camera3  — uint8 [H, W, 3]
+            observation.state           — float32 [6]
+            action                      — float32 [6]  absolute joint positions
+        """
+        self._step_counter += 1
+
         if self.cameras is None:
             return
-        
-        # Only record every 10th sim step
-        if step_counter % 10 != 0:
-            self._last_qpos = qpos.clone()
+
+        if self._step_counter % self.cfg.record_every_n_steps != 0:
             return
 
         frame = {}
+
         ATTACHED_CAM_KEYS = {"wrist"}
         for key, cam in self.cameras.items():
             if key in ATTACHED_CAM_KEYS:
                 cam.move_to_attach()
-            rgb, _, _, _ = cam.render()
+            rgb, _, _, _ = cam.render()                          # uint8 [H, W, 3]
             remapped_key = _CAM_REMAP.get(key, key)
             frame[f"observation.images.{remapped_key}"] = rgb
 
+        # State: 6 DOFs as float32
         frame["observation.state"] = qpos[:6].cpu().numpy().astype(np.float32)
-        frame["action"] = qpos[:6].cpu().numpy().astype(np.float32)  # absolute, not delta
 
-        self._last_qpos = qpos.clone()
+        # Action: absolute joint positions (SmolVLA SO-101 convention)
+        frame["action"] = qpos[:6].cpu().numpy().astype(np.float32)
+
         self._frames.append(frame)
-    
+
     # ── Segment execution ──────────────────────────────────────────────────
 
     def _execute_segment(self, target_cart_pos, gripper_target, settle_steps,
@@ -224,14 +285,13 @@ class SO101Oracle:
         alphas = torch.linspace(0.0, 1.0, cfg.steps_per_segment,
                                 device=target_qpos.device).unsqueeze(1)
         interp_configs       = prev_qpos + alphas * (target_qpos - prev_qpos)
-        interp_configs[:, 5] = prev_qpos[5]
+        interp_configs[:, 5] = prev_qpos[5]   # freeze gripper during arm motion
 
-        def _step(qpos):
+        def _step(qpos) -> bool:
             self.robot.control_dofs_position(qpos[_ARM_DOFS],    dofs_idx_local=_ARM_DOFS)
             self.robot.control_dofs_position(qpos[_GRIPPER_DOF], dofs_idx_local=_GRIPPER_DOF)
             self.scene.step()
-            self._record_step(qpos, self._step_counter)
-            self._step_counter += 1  
+            self._record_step(qpos)
             return check_sub_goals_fn(
                 self.robot, cube, target_zone, table_height, latch
             )["placed"]
@@ -262,6 +322,7 @@ class SO101Oracle:
             rot_tol=cfg.ik_rot_tol,
         )
 
+        # Phase 1: move arm to release position, gripper stays closed
         closed_qpos    = target_qpos.clone()
         closed_qpos[5] = prev_qpos[5]
         alphas = torch.linspace(0.0, 1.0, cfg.steps_per_segment,
@@ -273,16 +334,15 @@ class SO101Oracle:
             self.robot.control_dofs_position(interp_qpos[_ARM_DOFS],    dofs_idx_local=_ARM_DOFS)
             self.robot.control_dofs_position(interp_qpos[_GRIPPER_DOF], dofs_idx_local=_GRIPPER_DOF)
             self.scene.step()
-            self._record_step(interp_qpos, self._step_counter)
-            self._step_counter += 1
+            self._record_step(interp_qpos)
 
-        for _ in range(15):
+        for _ in range(15):   # arm settle
             self.robot.control_dofs_position(closed_qpos[_ARM_DOFS],    dofs_idx_local=_ARM_DOFS)
             self.robot.control_dofs_position(closed_qpos[_GRIPPER_DOF], dofs_idx_local=_GRIPPER_DOF)
             self.scene.step()
-            self._record_step(closed_qpos, self._step_counter)
-            self._step_counter += 1
+            self._record_step(closed_qpos)
 
+        # Phase 2: open gripper, arm stationary
         open_qpos    = closed_qpos.clone()
         open_qpos[5] = cfg.gripper_open
 
@@ -290,19 +350,18 @@ class SO101Oracle:
             self.robot.control_dofs_position(open_qpos[_ARM_DOFS],    dofs_idx_local=_ARM_DOFS)
             self.robot.control_dofs_position(open_qpos[_GRIPPER_DOF], dofs_idx_local=_GRIPPER_DOF)
             self.scene.step()
-            self._record_step(open_qpos, self._step_counter)
-            self._step_counter += 1
+            self._record_step(open_qpos)
 
+        # Phase 3: settle — cube drops onto target
         for _ in range(settle_steps):
             self.robot.control_dofs_position(open_qpos[_ARM_DOFS],    dofs_idx_local=_ARM_DOFS)
             self.robot.control_dofs_position(open_qpos[_GRIPPER_DOF], dofs_idx_local=_GRIPPER_DOF)
             self.scene.step()
-            self._record_step(open_qpos, self._step_counter)
-            self._step_counter += 1
+            self._record_step(open_qpos)
 
         return is_success_fn(cube, target_zone, table_height)
 
-    # ── Waypoints ──────────────────────────────────────────────────────────
+    # ── Waypoint computation ──────────────────────────────────────────────
 
     def _compute_waypoints(self, cube_pos, target_pos, table_height):
         cfg            = self.cfg
@@ -325,6 +384,8 @@ class SO101Oracle:
             waypoints.append(nominal + noise)
         return waypoints
 
+    # ── Quaternion utility ────────────────────────────────────────────────
+
     @staticmethod
     def _perturb_quat_z(base_quat, angle_rad):
         half = angle_rad / 2.0
@@ -340,170 +401,7 @@ class SO101Oracle:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Direct LeRobot v2.1 writer
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _write_episode_lerobot(
-    frames: list[dict],
-    ep_idx: int,
-    out_dir: Path,
-    global_frame_offset: int,
-    fps: int = FPS,
-    task_idx: int = 0,
-) -> int:
-    """
-    Write one episode's parquet file + one MP4 per camera into the
-    LeRobot v2.1 directory tree.
-
-    Returns the number of frames written (T).
-    """
-    T         = len(frames)
-    chunk_str = f"chunk-{ep_idx // CHUNK_SIZE:03d}"
-    ep_str    = f"episode_{ep_idx:06d}"
-
-    # ── Parquet ───────────────────────────────────────────────────────────────
-    state  = np.stack([f["observation.state"] for f in frames])  # [T, 6]
-    action = np.stack([f["action"]            for f in frames])  # [T, 6]
-
-    parquet_dir = out_dir / "data" / chunk_str
-    parquet_dir.mkdir(parents=True, exist_ok=True)
-
-    df = pd.DataFrame({
-        "timestamp":         (np.arange(T, dtype=np.float32) / fps).tolist(),
-        "frame_index":       np.arange(T, dtype=np.int64).tolist(),
-        "episode_index":     np.full(T, ep_idx, dtype=np.int64).tolist(),
-        "task_index":        np.full(T, task_idx, dtype=np.int64).tolist(),
-        # global index: unique across the whole dataset, never resets
-        "index":             np.arange(
-                                 global_frame_offset,
-                                 global_frame_offset + T,
-                                 dtype=np.int64,
-                             ).tolist(),
-        # store as list-of-arrays so pyarrow encodes them as fixed-size lists
-        "observation.state": list(state),
-        "action":            list(action),
-        "next.done":         np.concatenate(
-                                 [np.zeros(T - 1, dtype=bool), [True]]
-                             ).tolist(),
-    })
-    df.to_parquet(parquet_dir / f"{ep_str}.parquet", index=False)
-
-    # ── Videos ────────────────────────────────────────────────────────────────
-    for cam_key in CAMERA_KEYS:
-        obs_key   = f"observation.images.{cam_key}"
-        vid_dir   = out_dir / "videos" / chunk_str / obs_key
-        vid_dir.mkdir(parents=True, exist_ok=True)
-        vid_path  = vid_dir / f"{ep_str}.mp4"
-
-        img_frames = np.stack([f[obs_key] for f in frames])   # [T, H, W, 3] uint8
-        iio.imwrite(
-            str(vid_path),
-            img_frames,
-            fps=fps,
-            codec="libx264",
-            output_params=["-crf", "18", "-pix_fmt", "yuv420p"],
-        )
-
-    return T
-
-
-def _finalise_meta(
-    out_dir: Path,
-    episodes_meta: list[dict],
-    fps: int,
-    repo_id: str,
-    val_frac: float = 0.1,
-    language_instruction: str = LANGUAGE_INSTRUCTION,
-):
-    """
-    Write meta/info.json, meta/episodes.jsonl, meta/tasks.jsonl after all
-    episodes have been collected.
-    """
-    meta_dir = out_dir / "meta"
-    meta_dir.mkdir(parents=True, exist_ok=True)
-
-    n_eps        = len(episodes_meta)
-    n_val        = max(1, int(math.floor(n_eps * val_frac)))
-    n_train      = n_eps - n_val
-    total_frames = sum(e["length"] for e in episodes_meta)
-
-    # tasks.jsonl
-    with open(meta_dir / "tasks.jsonl", "w") as f:
-        f.write(json.dumps({"task_index": 0, "task": language_instruction}) + "\n")
-
-    # episodes.jsonl
-    with open(meta_dir / "episodes.jsonl", "w") as f:
-        for e in episodes_meta:
-            f.write(json.dumps(e) + "\n")
-
-    H, W = 256, 256
-
-    # Build features dict
-    features: dict = {
-        "observation.state": {
-            "dtype": "float32",
-            "shape": [STATE_DIM],
-            "names": [f"motor_{i}" for i in range(STATE_DIM)],
-        },
-        "action": {
-            "dtype": "float32",
-            "shape": [ACTION_DIM],
-            "names": [f"motor_{i}" for i in range(ACTION_DIM)],
-        },
-        "timestamp":     {"dtype": "float32", "shape": [1], "names": None},
-        "frame_index":   {"dtype": "int64",   "shape": [1], "names": None},
-        "episode_index": {"dtype": "int64",   "shape": [1], "names": None},
-        "task_index":    {"dtype": "int64",   "shape": [1], "names": None},
-        "index":         {"dtype": "int64",   "shape": [1], "names": None},
-        "next.done":     {"dtype": "bool",    "shape": [1], "names": None},
-    }
-
-    for cam_key in CAMERA_KEYS:
-        features[f"observation.images.{cam_key}"] = {
-            "dtype": "video",
-            "shape": [H, W, 3],
-            "names": ["height", "width", "channel"],
-            "video_info": {
-                "video.fps":          float(fps),
-                "video.codec":        "h264",
-                "video.pix_fmt":      "yuv420p",
-                "video.is_depth_map": False,
-                "has_audio":          False,
-            },
-        }
-
-    info = {
-        "codebase_version": "v2.1",          # lerobot 0.5.x expects this
-        "robot_type":       "so101",
-        "total_episodes":   n_eps,
-        "total_frames":     total_frames,
-        "total_tasks":      1,
-        "total_videos":     n_eps * len(CAMERA_KEYS),
-        "total_chunks":     math.ceil(n_eps / CHUNK_SIZE),
-        "chunks_size":      CHUNK_SIZE,
-        "fps":              fps,
-        "splits": {
-            "train": f"0:{n_train}",
-            "val":   f"{n_train}:{n_eps}",
-        },
-        "data_path":  "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
-        "video_path": "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
-        "features":   features,
-        "repo_id":    repo_id,
-        "tasks":      [language_instruction],
-    }
-
-    with open(meta_dir / "info.json", "w") as f:
-        json.dump(info, f, indent=2)
-
-    print(f"\n── Dataset meta written ──────────────────────────────────")
-    print(f"  Total episodes : {n_eps}  (train {n_train} / val {n_val})")
-    print(f"  Total frames   : {total_frames}")
-    print(f"  Output         : {out_dir}")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  collect_demonstrations  —  direct v2.1 edition
+#  collect_demonstrations  —  writes directly to LeRobot v3.0
 # ══════════════════════════════════════════════════════════════════════════════
 
 def collect_demonstrations(
@@ -518,56 +416,80 @@ def collect_demonstrations(
     n_episodes: int     = 200,
     output_dir: str     = "demos/lerobot/",
     fps: int            = FPS,
-    val_frac: float     = 0.1,
     repo_id: str        = "local/genesis_pickplace",
+    push_to_hub: bool   = False,
     save_failures: bool = True,
     cube_color: str     = DEFAULT_CUBE_COLOR,
+    img_h: int          = 256,
+    img_w: int          = 256,
 ) -> list[bool]:
     """
-    Run the oracle for n_episodes and write each SUCCESSFUL episode directly
-    into a LeRobot v2.1 dataset tree (parquet + mp4) — no HDF5 intermediary,
-    no convert_demos.py step.
+    Run the oracle for n_episodes and write each episode directly into a
+    LeRobot v3.0 dataset tree using the official LeRobotDataset API.
 
-    Failed episodes are optionally saved to <output_dir>/../failures_lerobot/
-    for debugging, using the same layout.
+    Successful episodes → <output_dir>
+    Failed episodes     → <parent of output_dir>/failures_lerobot/  (if save_failures=True)
 
-    Returns a list of bool (True = success) for each attempted episode.
+    The official write flow is:
+        dataset = LeRobotDataset.create(...)
+        for each episode:
+            dataset.add_frame(frame_dict)
+            dataset.save_episode()
+        dataset.finalize()         # ← mandatory, closes parquet writers
+        dataset.push_to_hub()      # ← optional
+
+    Returns a list of bool (True = success) per attempted episode.
     """
     cfg    = OracleConfig()
     oracle = SO101Oracle(so101, scene, cameras, cfg)
 
     language_instruction = language_instruction_for(cube_color)
+    features             = make_features(img_h, img_w)
 
-    out_dir  = Path(output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
+    out_dir  = Path(output_dir).resolve()
     fail_dir = out_dir.parent / "failures_lerobot"
+
+    # ── Create LeRobotDataset for successes ───────────────────────────────────
+    print(f"[info] Creating LeRobot v3.0 dataset at: {out_dir}")
+    dataset = LeRobotDataset.create(
+        repo_id=repo_id,
+        fps=fps,
+        root=str(out_dir),
+        features=features,
+        use_videos=True,
+        image_writer_threads=4,   # encode mp4 frames in parallel
+    )
+
+    # ── Optionally create a second dataset for failures ───────────────────────
+    fail_dataset = None
     if save_failures:
-        fail_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[info] Creating failures dataset at: {fail_dir}")
+        fail_dataset = LeRobotDataset.create(
+            repo_id=repo_id + "_failures",
+            fps=fps,
+            root=str(fail_dir),
+            features=features,
+            use_videos=True,
+            image_writer_threads=4,
+        )
 
     home_pose = np.zeros(so101.n_dofs)
     results: list[bool] = []
+    successes = 0
 
-    # Running counters
-    successes           = 0
-    saved_eps           = 0       # successful episodes index
-    saved_fails         = 0       # failed episodes index
-    global_frame_offset = 0       # total frames written to success dataset
-    fail_frame_offset   = 0       # total frames written to failure dataset
-
-    episodes_meta: list[dict] = []
-    fail_episodes_meta: list[dict] = []
+    print(f"\nCollecting {n_episodes} episodes  (fps={fps}, cameras={CAMERA_KEYS})")
+    print(f"Task: \"{language_instruction}\"\n")
 
     for ep in range(n_episodes):
         # ── Randomise cube & target positions ────────────────────────────────
         MIN_SEP = 0.12
         for _ in range(50):
-            cube_xy   = np.array([0.25, 0.00])  + np.random.uniform(-0.05, 0.05, 2)
-            target_xy = np.array([0.15, -0.15]) + np.random.uniform(-0.06, 0.06, 2)
+            cube_xy   = np.array([0.25, 0.00])  + np.random.uniform(-0.05,  0.05, 2)
+            target_xy = np.array([0.15, -0.15]) + np.random.uniform(-0.06,  0.06, 2)
             if np.linalg.norm(cube_xy - target_xy) >= MIN_SEP:
                 break
 
-        # ── Reset ─────────────────────────────────────────────────────────────
+        # ── Reset environment ─────────────────────────────────────────────────
         so101.set_dofs_position(home_pose)
         so101.set_dofs_velocity(np.zeros(so101.n_dofs))
         so101.control_dofs_position(home_pose)
@@ -581,65 +503,64 @@ def collect_demonstrations(
             so101.control_dofs_position(home_pose)
             scene.step()
 
-        # ── Run oracle ────────────────────────────────────────────────────────
+        # ── Run oracle (recording happens inside) ─────────────────────────────
         success = oracle.run_episode(
             cube, target_zone, table_height,
             is_success_fn, check_sub_goals_fn,
         )
 
         label = "PASS ✓" if success else "FAIL ✗"
-        print(f"[{ep + 1:3d}/{n_episodes}] {label}", flush=True)
+        frames = oracle.get_recorded_frames()
+        print(f"[{ep + 1:3d}/{n_episodes}] {label}  T={len(frames)}", flush=True)
+
         results.append(success)
 
-        frames = oracle.get_recorded_frames()
+        if not frames:
+            print(f"           [warn] no frames recorded — skipping")
+            continue
 
-        # ── Write episode directly to LeRobot layout ─────────────────────────
-        if success and frames:
+        # ── Write frames to the appropriate dataset ───────────────────────────
+        target_ds = dataset if success else fail_dataset
+
+        if target_ds is not None:
+            for frame in frames:
+                target_ds.add_frame(frame)
+
+            # save_episode accepts a task string for task-conditioned training
+            target_ds.save_episode(task=language_instruction)
+
+        if success:
             successes += 1
-            T = _write_episode_lerobot(
-                frames, saved_eps, out_dir,
-                global_frame_offset, fps=fps,
-            )
-            episodes_meta.append({
-                "episode_index": saved_eps,
-                "tasks":         [LANGUAGE_INSTRUCTION],
-                "length":        T,
-            })
-            global_frame_offset += T
-            saved_eps           += 1
 
-        elif not success and frames and save_failures:
-            T = _write_episode_lerobot(
-                frames, saved_fails, fail_dir,
-                fail_frame_offset, fps=fps,
-            )
-            fail_episodes_meta.append({
-                "episode_index": saved_fails,
-                "tasks":         [LANGUAGE_INSTRUCTION],
-                "length":        T,
-            })
-            fail_frame_offset += T
-            saved_fails       += 1
+    # ── Finalize — mandatory before push_to_hub or loading for training ───────
+    print(f"\n[info] Finalizing dataset (flushing parquet writers)…")
+    dataset.finalize()
+    if fail_dataset is not None:
+        fail_dataset.finalize()
 
-    # ── Finalise meta files ───────────────────────────────────────────────────
-    if episodes_meta:
-        _finalise_meta(out_dir, episodes_meta, fps, repo_id, val_frac,
-                       language_instruction=language_instruction)
-
-    if save_failures and fail_episodes_meta:
-        _finalise_meta(fail_dir, fail_episodes_meta, fps,
-                       repo_id + "_failures", val_frac=0.0,
-                       language_instruction=language_instruction)
+    # ── Optional push to Hub ──────────────────────────────────────────────────
+    if push_to_hub:
+        print(f"[info] Pushing to Hub as '{repo_id}' …")
+        dataset.push_to_hub()
+        if fail_dataset is not None:
+            fail_dataset.push_to_hub()
 
     # ── Summary ───────────────────────────────────────────────────────────────
     print(f"\n{'─' * 50}")
     print(f"Collection complete: {successes}/{n_episodes} successful "
-          f"({successes / n_episodes:.1%})")
-    print(f"Saved {saved_eps} episodes  →  {out_dir}")
+          f"({successes / max(n_episodes, 1):.1%})")
+    print(f"Dataset written to : {out_dir}")
     if save_failures:
-        print(f"Saved {saved_fails} failures  →  {fail_dir}")
+        print(f"Failures written to: {fail_dir}")
     print(f"{'─' * 50}")
-    print(f"\n[next] Fine-tune directly with:")
-    print(f"       python finetune.py --dataset_dir {out_dir}")
+    print(f"\n[next] Fine-tune with:")
+    print(f"       lerobot-train \\")
+    print(f"         --policy.path=lerobot/smolvla_base \\")
+    print(f"         --dataset.repo_id={repo_id} \\")
+    print(f"         --dataset.root={out_dir} \\")
+    print(f"         --batch_size=64 \\")
+    print(f"         --steps=20000 \\")
+    print(f"         --output_dir=outputs/train/smolvla_genesis \\")
+    print(f"         --policy.device=cuda")
 
     return results
