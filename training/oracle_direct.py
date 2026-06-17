@@ -531,8 +531,8 @@ def collect_demonstrations(
             for frame in frames:
                 target_ds.add_frame(frame)
 
-            # save_episode accepts a task string for task-conditioned training
-            target_ds.save_episode(task=language_instruction)
+            # task is already embedded per-frame via frame["task"] in add_frame()
+            target_ds.save_episode()
 
         if success:
             successes += 1
