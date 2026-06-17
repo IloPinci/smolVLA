@@ -107,6 +107,7 @@ def build_command(args, dataset_dir: Path) -> list[str]:
         f"--policy.device={device}",
         f"--save_freq={args.save_freq}",
         f"--wandb.enable={'true' if args.wandb else 'false'}",
+        f"--repo_id=local/smolvla_finetuned",
     ]
 
     if args.wandb and args.wandb_project:
