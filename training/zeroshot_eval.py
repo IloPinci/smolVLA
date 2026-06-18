@@ -18,6 +18,7 @@ import argparse
 import csv
 import os
 import sys
+import json
 from pathlib import Path
 
 import imageio.v3 as iio
@@ -72,42 +73,51 @@ class SmolVLAAgent:
     Thin wrapper that converts Genesis observations into the dict format
     SmolVLAPolicy expects and returns a numpy action array.
     """
-    def __init__(self, checkpoint: str = "lerobot/smolvla_base", device: str = "cuda"):
+    def __init__(self, checkpoint: str, dataset_dir: str, device: str = "cuda"):
         self.device = device
         print(f"[info] loading SmolVLA checkpoint: {checkpoint}")
         self.policy = SmolVLAPolicy.from_pretrained(checkpoint, device=device)
         self.policy.eval()
-        self.tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolVLM2-500M-Video-Instruct")
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"
+        )
+
+        # Load normalization stats
+        stats_path = Path(dataset_dir) / "meta" / "stats.json"
+        if not stats_path.exists():
+            raise FileNotFoundError(f"stats.json not found at {stats_path}")
+        with open(stats_path) as f:
+            raw = json.load(f)
+
+        self.state_mean = np.array(raw["observation.state"]["mean"], dtype=np.float32)
+        self.state_std  = np.array(raw["observation.state"]["std"],  dtype=np.float32)
+        self.act_mean   = np.array(raw["action"]["mean"],            dtype=np.float32)
+        self.act_std    = np.array(raw["action"]["std"],             dtype=np.float32)
+
+        print(f"[info] normalization stats loaded from {stats_path}")
+        print(f"       state_mean : {np.round(self.state_mean, 3)}")
+        print(f"       state_std  : {np.round(self.state_std,  3)}")
+        print(f"       action_mean: {np.round(self.act_mean,   3)}")
+        print(f"       action_std : {np.round(self.act_std,    3)}")
         print("[info] SmolVLA loaded successfully.")
+
 
     def reset(self):
         """Call at the start of every episode to clear action chunk buffer."""
         self.policy.reset()
 
     @torch.no_grad()
-    def act(self, context_rgb: np.ndarray, wrist_rgb: np.ndarray, top_rgb: np.ndarray,
-            joint_state: np.ndarray, language_instruction: str = LANGUAGE_INSTRUCTION) -> np.ndarray:
-        """
-        Parameters
-        ----------
-        context_rgb  : uint8 [256, 256, 3]
-        wrist_rgb    : uint8 [256, 256, 3]
-        joint_state  : float32 [6]   joint angles (radians)
+    def act(self, context_rgb, wrist_rgb, top_rgb,
+            joint_state, language_instruction=LANGUAGE_INSTRUCTION):
 
-        Returns
-        -------
-        action : float32 [6]   6 joint deltas + gripper absolute position
-        """
-        def to_tensor(arr, dtype=torch.float32):
-            t = torch.from_numpy(arr.copy()).to(dtype=dtype, device=self.device)
-            return t.unsqueeze(0)   # add batch dim
+        def img_to_tensor(arr):
+            t = torch.from_numpy(arr.copy()).float() / 255.0      # [H,W,3] -> [0,1]
+            return t.permute(2, 0, 1).unsqueeze(0).to(self.device) # [1,3,H,W]
 
-        # Images: [1, C, H, W] float32 in [0, 1]
-        ctx_t   = to_tensor(context_rgb).permute(0, 3, 1, 2) / 255.0
-        wrist_t = to_tensor(wrist_rgb).permute(0, 3, 1, 2)   / 255.0
-        top_t   = to_tensor(top_rgb).permute(0, 3, 1, 2)     / 255.0
+        # Normalize state — THE fix
+        norm_state = (joint_state - self.state_mean) / (self.state_std + 1e-8)
+        state_t = torch.from_numpy(norm_state).float().unsqueeze(0).to(self.device)
 
-        # Tokenize the language instruction
         enc = self.tokenizer(
             [language_instruction],
             return_tensors="pt",
@@ -117,22 +127,23 @@ class SmolVLAAgent:
         )
 
         obs = {
-            "observation.images.camera1":          ctx_t,
-            "observation.images.camera2":          wrist_t,
-            "observation.images.camera3":          top_t,
-            "observation.state":                   to_tensor(joint_state),
-            #! tokenized language
+            "observation.images.camera1":          img_to_tensor(context_rgb),
+            "observation.images.camera2":          img_to_tensor(wrist_rgb),
+            "observation.images.camera3":          img_to_tensor(top_rgb),
+            "observation.state":                   state_t,
             "observation.language.tokens":         enc["input_ids"].to(self.device),
             "observation.language.attention_mask": enc["attention_mask"].bool().to(self.device),
         }
 
-        action_t = self.policy.select_action(obs)  # [1, action_dim] or [1, chunk, action_dim]
-
-        # Handle chunked output — take first action in chunk
+        action_t = self.policy.select_action(obs)
         if action_t.ndim == 3:
             action_t = action_t[:, 0, :]
 
-        return action_t.squeeze(0).cpu().numpy()
+        action_norm = action_t.squeeze(0).cpu().numpy()
+
+        # Unnormalize output — model outputs normalized values
+        action = action_norm * self.act_std + self.act_mean
+        return action.astype(np.float32)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -299,6 +310,12 @@ def run_rollout(agent, scene, so101, cube, target_zone,
         wrist_rgb, _, _, _ = wrist_cam.render()
         top_rgb,   _, _, _ = top_cam.render()
 
+        # we fill the buffers
+        if step % RECORD_EVERY == 0:
+            vid_context.append(ctx_rgb.copy())
+            vid_wrist.append(wrist_rgb.copy())
+            vid_top.append(top_rgb.copy())
+
         qpos   = so101.get_dofs_position().cpu().numpy()
         action = agent.act(ctx_rgb, wrist_rgb, top_rgb, qpos[:6])
 
@@ -352,6 +369,8 @@ def main():
     parser.add_argument("--n",          type=int, default=25, help="number of rollouts")
     parser.add_argument("--out",        default="results/zeroshot.csv")
     parser.add_argument("--seed",       type=int, default=42)
+    parser.add_argument("--dataset_dir", default="demos/lerobot/",
+                    help="Dataset used for fine-tuning (must contain meta/stats.json)")
     args = parser.parse_args()
 
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
@@ -362,7 +381,7 @@ def main():
 
     # ── Load policy ───────────────────────────────────────────────────────────
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    agent  = SmolVLAAgent(checkpoint=args.checkpoint, device=device)
+    agent  = SmolVLAAgent(checkpoint=args.checkpoint,dataset_dir=args.dataset_dir,device=device,)
 
     # ── Run rollouts ──────────────────────────────────────────────────────────
     rng     = np.random.default_rng(args.seed)
