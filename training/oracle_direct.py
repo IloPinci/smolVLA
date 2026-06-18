@@ -257,15 +257,14 @@ class SO101Oracle:
             remapped_key = _CAM_REMAP.get(key, key)
             frame[f"observation.images.{remapped_key}"] = rgb
 
-        # State: 6 DOFs as float32
-        frame["observation.state"] = qpos[:6].cpu().numpy().astype(np.float32)
+        # State = ACTUAL robot position, read BEFORE this step's command is applied
+        actual_qpos = self.robot.get_dofs_position()
+        frame["observation.state"] = actual_qpos[:6].cpu().numpy().astype(np.float32)
 
-        # Action: absolute joint positions (SmolVLA SO-101 convention)
+        # Action = the target we are about to command
         frame["action"] = qpos[:6].cpu().numpy().astype(np.float32)
 
-        # Task string — required by LeRobotDataset.add_frame() in v3.0
         frame["task"] = self.language_instruction
-
         self._frames.append(frame)
 
     # ── Segment execution ──────────────────────────────────────────────────
@@ -293,10 +292,10 @@ class SO101Oracle:
         interp_configs[:, 5] = prev_qpos[5]   # freeze gripper during arm motion
 
         def _step(qpos) -> bool:
+            self._record_step(qpos)
             self.robot.control_dofs_position(qpos[_ARM_DOFS],    dofs_idx_local=_ARM_DOFS)
             self.robot.control_dofs_position(qpos[_GRIPPER_DOF], dofs_idx_local=_GRIPPER_DOF)
             self.scene.step()
-            self._record_step(qpos)
             return check_sub_goals_fn(
                 self.robot, cube, target_zone, table_height, latch
             )["placed"]
