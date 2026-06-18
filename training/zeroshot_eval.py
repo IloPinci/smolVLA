@@ -272,7 +272,7 @@ def run_rollout(agent, scene, so101, cube, target_zone,
         action[6]   — gripper absolute position (we use this for control)
     """
     agent.reset()
-    latch = {"lifted": False}
+    latch = {"lifted": False, "reached": False}
 
     top_cam     = cameras["top"]
     wrist_cam   = cameras["wrist"]
