@@ -311,8 +311,8 @@ class SO101Oracle:
         return target_qpos, False
 
     def _execute_release_segment(self, target_cart_pos, settle_steps,
-                                 prev_qpos, cube, target_zone, table_height,
-                                 is_success_fn):
+                             prev_qpos, cube, target_zone, table_height,
+                             is_success_fn):
         cfg = self.cfg
 
         noisy_quat = self._perturb_quat_z(
@@ -335,33 +335,33 @@ class SO101Oracle:
         interp[:, 5] = prev_qpos[5]
 
         for interp_qpos in interp:
+            self._record_step(interp_qpos)
             self.robot.control_dofs_position(interp_qpos[_ARM_DOFS],    dofs_idx_local=_ARM_DOFS)
             self.robot.control_dofs_position(interp_qpos[_GRIPPER_DOF], dofs_idx_local=_GRIPPER_DOF)
             self.scene.step()
-            self._record_step(interp_qpos)
 
         for _ in range(15):   # arm settle
+            self._record_step(closed_qpos)
             self.robot.control_dofs_position(closed_qpos[_ARM_DOFS],    dofs_idx_local=_ARM_DOFS)
             self.robot.control_dofs_position(closed_qpos[_GRIPPER_DOF], dofs_idx_local=_GRIPPER_DOF)
             self.scene.step()
-            self._record_step(closed_qpos)
 
         # Phase 2: open gripper, arm stationary
         open_qpos    = closed_qpos.clone()
         open_qpos[5] = cfg.gripper_open
 
         for _ in range(20):
+            self._record_step(open_qpos)
             self.robot.control_dofs_position(open_qpos[_ARM_DOFS],    dofs_idx_local=_ARM_DOFS)
             self.robot.control_dofs_position(open_qpos[_GRIPPER_DOF], dofs_idx_local=_GRIPPER_DOF)
             self.scene.step()
-            self._record_step(open_qpos)
 
         # Phase 3: settle — cube drops onto target
         for _ in range(settle_steps):
+            self._record_step(open_qpos)
             self.robot.control_dofs_position(open_qpos[_ARM_DOFS],    dofs_idx_local=_ARM_DOFS)
             self.robot.control_dofs_position(open_qpos[_GRIPPER_DOF], dofs_idx_local=_GRIPPER_DOF)
             self.scene.step()
-            self._record_step(open_qpos)
 
         return is_success_fn(cube, target_zone, table_height)
 
