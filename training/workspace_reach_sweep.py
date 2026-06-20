@@ -34,7 +34,7 @@ Two views of the result are produced:
 Usage
 -----
     python workspace_reach_sweep.py \
-        --xml ../so101_arm/so101_new_calib.xml \
+        --xml so101_arm/so101_new_calib.xml \
         --out results/workspace_reach.png
 
     # skip the grid sweep / PNG, just print the radial map fast
@@ -45,6 +45,8 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -386,38 +388,88 @@ def main():
             radial_results[label] = res
             print_radial_table(res, label)
 
-        # ── Combined "safe at every height" envelope ─────────────────────────
+        # ── Combined "safe at every height AND every angle" envelope ─────────
+        # NOTE: this is intentionally the most conservative possible number --
+        # it intersects across ALL heights (including Pregrasp/Lift, which are
+        # thin rings due to the fixed downward orientation) AND all angles.
+        # It answers "what radius works from literally any direction at any
+        # height", which is usually far stricter than what you actually need.
+        # See the per-angle tables above, and the direct corner check below,
+        # for the realistic answer for YOUR specific spawn region.
         print("\n" + "=" * 70)
-        print("COMBINED RADIUS ENVELOPE (safe at every height checked)")
+        print("WORST-CASE COMBINED ENVELOPE (conservative -- all angles, all heights)")
         print("=" * 70)
-        global_inner = max(
-            max(r["r_inner"] for r in res if r["r_inner"] is not None)
-            for res in radial_results.values()
-        )
-        global_outer = min(
-            min(r["r_outer"] for r in res if r["r_outer"] is not None)
-            for res in radial_results.values()
-        )
-        print(f"  Safe radius range from base {tuple(args.radial_center)}: "
-              f"[{global_inner:.3f}, {global_outer:.3f}] m")
-        print(f"  (smaller than this = arm can't reach down/over the cube; "
-              f"larger than this = out of reach at some waypoint height)")
+        try:
+            global_inner = max(
+                max(r["r_inner"] for r in res if r["r_inner"] is not None)
+                for res in radial_results.values()
+            )
+            global_outer = min(
+                min(r["r_outer"] for r in res if r["r_outer"] is not None)
+                for res in radial_results.values()
+            )
+        except ValueError:
+            global_inner = global_outer = None
 
-        # check current jitter rectangles against this envelope
-        print(f"\n  Checking your jitter ranges against this envelope:")
-        for name, center, half in [
-            ("cube",   args.cube_center,   args.cube_half),
-            ("target", args.target_center, args.target_half),
-        ]:
-            cx, cy = center
-            hx, hy = half
-            corners = [(cx + dx * hx, cy + dy * hy) for dx in (-1, 1) for dy in (-1, 1)]
-            bx, by = args.radial_center
-            radii = [np.hypot(x - bx, y - by) for x, y in corners]
-            r_lo, r_hi = min(radii), max(radii)
-            ok = (r_lo >= global_inner) and (r_hi <= global_outer)
-            status = "OK -- inside safe envelope" if ok else "WARNING -- outside safe envelope"
-            print(f"    {name:<8} corner radii: [{r_lo:.3f}, {r_hi:.3f}] m  -> {status}")
+        if global_inner is None or global_outer is None or global_inner > global_outer:
+            print("  No single radius is safe from EVERY angle at EVERY height "
+                  "(expected -- Pregrasp/Lift are thin, angle-dependent rings, "
+                  "not full discs). This number is not usable as-is.")
+            print("  Use the per-angle tables above, or the direct corner check "
+                  "below, instead.")
+        else:
+            print(f"  Safe radius range from base {tuple(args.radial_center)}, "
+                  f"valid from ANY direction: [{global_inner:.3f}, {global_outer:.3f}] m")
+
+    # ── Direct exact-point check (no radius/angle binning -- ground truth) ──
+    print("\n" + "=" * 70)
+    print("DIRECT CHECK: exact cube/target jitter corners, all 4 heights")
+    print("=" * 70)
+    print("(this re-solves IK at the literal coordinates you'd actually spawn at -- "
+          "no radius/angle approximation, so it's the most trustworthy signal)\n")
+
+    def corners_of(center, half):
+        cx, cy = center
+        hx, hy = half
+        pts = {"center": (cx, cy)}
+        for dx in (-1, 1):
+            for dy in (-1, 1):
+                pts[f"corner({dx:+d},{dy:+d})"] = (cx + dx * hx, cy + dy * hy)
+        return pts
+
+    targets = {
+        "cube":   corners_of(args.cube_center, args.cube_half),
+        "target": corners_of(args.target_center, args.target_half),
+    }
+
+    overall_ok = True
+    for group_name, pts in targets.items():
+        print(f"-- {group_name} --")
+        for pt_name, (x, y) in pts.items():
+            row_results = []
+            for h_label, z in heights.items():
+                ok, err = check_point(so101, end_effector, home_qpos,
+                                      target_xyz=(x, y, z), quat=GRASP_QUAT,
+                                      lower=lower, upper=upper)
+                row_results.append((h_label, ok, err))
+                if not ok:
+                    overall_ok = False
+            status_str = "  ".join(
+                f"{h[:6]}:{'OK' if ok else 'FAIL'}({err*1000:.1f}mm)"
+                for h, ok, err in row_results
+            )
+            print(f"  {pt_name:<14} ({x:+.3f},{y:+.3f})  {status_str}")
+        print()
+
+    if overall_ok:
+        print("[ok] Every jitter corner is reachable at every waypoint height. "
+              "Your current cube/target ranges look safe.")
+    else:
+        print("[warn] At least one corner/height combo failed above -- "
+              "those are the specific points to shrink your jitter range away from.")
+        print("       Note: Pregrasp/Lift failures here may be optimistic-pessimistic "
+              "(cold-start IK is stricter than the oracle's warm-started interpolation), "
+              "so weight Grasp/Place failures more heavily than Pregrasp/Lift ones.")
 
     print("\nDone.")
 
