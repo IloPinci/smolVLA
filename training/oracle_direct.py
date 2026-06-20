@@ -2,40 +2,32 @@
 oracle_direct.py  —  SO-101 scripted oracle + DIRECT LeRobot v3.0 writer
 =========================================================================
 
-Writes episodes DIRECTLY into the LeRobot v3.0 format during collection
-using the official LeRobotDataset API.  No convert step, no v2.1 intermediate.
+Changes from previous version
+------------------------------
+• collect_demonstrations() accepts two new parameters:
+    - scene_perturbation : ScenePerturbation
+        Bundles cube_color, cube_position_preset, and distractor spheres.
+        When present it overrides the cube_color kwarg and the oracle's
+        built-in rejection-sampling spawn logic.
+    - sphere_entities : list[gs.Entity]
+        Genesis entity handles for distractor spheres returned by
+        build_environment().  These are repositioned at the start of
+        every episode via scene_perturbation.resolve_spawn() for the
+        cube/target and the sphere configs for the spheres themselves.
 
-Camera architecture
--------------------
-Two camera dicts are accepted:
+• The language instruction stored in every episode frame is now derived
+  from scene_perturbation.language_instruction (which reflects the
+  cube colour), not a hard-coded constant.
 
-  cameras         — TRAINING cameras (256x256).  These are rendered every
-                    record_every_n_steps sim steps and written into the
-                    LeRobot dataset as observation frames.  Subject to
-                    CameraPerturbation.blackout — frames are zeroed before
-                    storage when the relevant mode is active.
-
-  witness_cameras — WITNESS cameras (1280x720, optional).  Rendered at the
-                    same cadence as training cameras but written ONLY to
-                    MP4 review videos, never into the dataset.  Always
-                    record the true, unperturbed view.
-
-Key API flow (v3.0):
-    dataset = LeRobotDataset.create(repo_id, fps, root, features)
-    for each episode:
-        dataset.add_frame(frame_dict)   # called once per recorded timestep
-        dataset.save_episode()          # called at episode end
-    dataset.finalize()                  # MUST be called before push_to_hub
-    dataset.push_to_hub()              # optional — omit for local-only
-
-Action format — ABSOLUTE joint positions (6-DOF):
-    action[:5]  — arm joint absolute positions (radians)
-    action[5]   — gripper absolute position
+Everything else is unchanged.
 """
+
+from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import List, Optional
 
 import imageio.v3 as iio
 import numpy as np
@@ -44,9 +36,10 @@ import torch
 from scene_params import (
     language_instruction_for, DEFAULT_CUBE_COLOR,
     CameraPerturbation, NOMINAL_PERTURBATION,
+    ScenePerturbation, NOMINAL_SCENE,
+    SphereConfig,
 )
 
-# ── LeRobot v3 API ─────────────────────────────────────────────────────────
 try:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 except ImportError as e:
@@ -61,20 +54,13 @@ except ImportError as e:
 #  Constants
 # ══════════════════════════════════════════════════════════════════════════════
 
-CAMERA_KEYS          = ["camera1", "camera2", "camera3"]
-STATE_DIM            = 6
-ACTION_DIM           = 6
-FPS                  = 10
-LANGUAGE_INSTRUCTION = language_instruction_for(DEFAULT_CUBE_COLOR)
+CAMERA_KEYS = ["camera1", "camera2", "camera3"]
+STATE_DIM   = 6
+ACTION_DIM  = 6
+FPS         = 10
 
-_CAM_REMAP = {
-    "context": "camera1",
-    "wrist":   "camera2",
-    "top":     "camera3",
-}
-# Reverse map: LeRobot key → role (for blackout lookup)
+_CAM_REMAP   = {"context": "camera1", "wrist": "camera2", "top": "camera3"}
 _KEY_TO_ROLE = {v: k for k, v in _CAM_REMAP.items()}
-
 _ARM_DOFS    = np.arange(5)
 _GRIPPER_DOF = np.array([5])
 
@@ -102,23 +88,23 @@ def make_features(img_h: int = 256, img_w: int = 256) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Config
+#  Oracle config
 # ══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class OracleConfig:
-    pos_noise_sigma:   float = 0.004
-    rot_noise_sigma:   float = np.deg2rad(2)
-    steps_per_segment: int   = 30
-    pregrasp_clearance: float = 0.12
-    lift_height:        float = 0.15
-    carry_clearance:    float = 0.15
-    gripper_open:       float = 0.8
-    gripper_close_safe: float = 0.18
-    ik_pos_tol:         float = 1e-4
-    ik_rot_tol:         float = 1e-4
+    pos_noise_sigma:      float = 0.004
+    rot_noise_sigma:      float = np.deg2rad(2)
+    steps_per_segment:    int   = 30
+    pregrasp_clearance:   float = 0.12
+    lift_height:          float = 0.15
+    carry_clearance:      float = 0.15
+    gripper_open:         float = 0.8
+    gripper_close_safe:   float = 0.18
+    ik_pos_tol:           float = 1e-4
+    ik_rot_tol:           float = 1e-4
     settle_steps: list = field(default_factory=lambda: [10, 50, 100, 25, 25, 60])
-    record_every_n_steps: int = 10
+    record_every_n_steps: int   = 10
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -127,54 +113,59 @@ class OracleConfig:
 
 class SO101Oracle:
     """
-    Scripted oracle that records training frames AND optional witness frames.
-
-    Parameters
-    ----------
-    cameras : dict
-        Training cameras {"context": cam, "wrist": cam, "top": cam}.
-        Rendered at IMG_RES and written into the dataset.
-    witness_cameras : dict or None
-        High-res witness cameras {"witness_context": cam, ...}.
-        Rendered at the same cadence but NEVER written to the dataset.
-    perturbation : CameraPerturbation
-        Controls blackout applied to training frames post-render.
-        Position/tilt perturbations are already baked into the camera
-        objects by attach_cameras() in two_camera_setup.py.
+    Scripted oracle.  Accepts an optional `scene_perturbation` so that the
+    language instruction embedded in every recorded frame reflects the
+    current cube colour automatically.
     """
 
-    def __init__(self, so101, scene,
-                 cameras=None,
-                 witness_cameras=None,
-                 perturbation: CameraPerturbation = NOMINAL_PERTURBATION,
-                 cfg: OracleConfig = OracleConfig(),
-                 language_instruction: str = LANGUAGE_INSTRUCTION):
-        self.robot                = so101
-        self.scene                = scene
-        self.cameras              = cameras
-        self.witness_cameras      = witness_cameras   # NEW — high-res, never in dataset
-        self.perturbation         = perturbation
-        self.cfg                  = cfg
-        self.language_instruction = language_instruction
-        self._rng                 = np.random.default_rng()
+    def __init__(
+        self,
+        so101,
+        scene,
+        cameras=None,
+        witness_cameras=None,
+        perturbation: CameraPerturbation = NOMINAL_PERTURBATION,
+        cfg: OracleConfig = OracleConfig(),
+        language_instruction: str | None = None,
+    ):
+        self.robot           = so101
+        self.scene           = scene
+        self.cameras         = cameras
+        self.witness_cameras = witness_cameras
+        self.perturbation    = perturbation
+        self.cfg             = cfg
+        # language_instruction can be overridden per-episode if cube color changes
+        self.language_instruction = (
+            language_instruction or language_instruction_for(DEFAULT_CUBE_COLOR)
+        )
+        self._rng = np.random.default_rng()
 
         self.end_effector = so101.get_link("moving_jaw_so101_v1")
         self.grasp_quat   = np.array([0.707107, 0.0, -0.707107, 0.0])
 
-        self._frames:         list[dict] = []   # training frames (written to dataset)
-        self._witness_frames: list[dict] = []   # witness frames (written to video only)
+        self._frames:         list[dict] = []
+        self._witness_frames: list[dict] = []
         self._last_qpos:      torch.Tensor | None = None
         self._step_counter:   int = 0
 
-    # ── Public API ─────────────────────────────────────────────────────────
+    # ── Public API ──────────────────────────────────────────────────────────
 
     def run_episode(self, cube, target_zone, table_height,
-                    is_success_fn, check_sub_goals_fn) -> bool:
+                    is_success_fn, check_sub_goals_fn,
+                    language_instruction: str | None = None) -> bool:
+        """
+        Run one episode.  `language_instruction` can be passed to override
+        the instance default (useful when cube colour changes per episode).
+        """
         self._frames         = []
         self._witness_frames = []
         self._last_qpos      = None
         self._step_counter   = 0
         self._subgoal_latch: dict = {"lifted": False}
+
+        # Allow per-episode instruction override (colour perturbation)
+        if language_instruction is not None:
+            self.language_instruction = language_instruction
 
         cube_pos   = cube.get_pos().cpu().numpy()
         target_pos = target_zone.get_pos().cpu().numpy()
@@ -215,19 +206,12 @@ class SO101Oracle:
         return success
 
     def get_recorded_frames(self) -> list[dict]:
-        """Training frames to be written into the LeRobot dataset."""
         return self._frames
 
     def get_witness_frames(self) -> list[dict]:
-        """
-        Witness frames for human review.  Each dict has keys:
-            "witness_context"  — uint8 [H, W, 3]   (1280×720)
-            "witness_wrist"    — uint8 [H, W, 3]   (if witness wrist cam attached)
-            "witness_top"      — uint8 [H, W, 3]
-        """
         return self._witness_frames
 
-    # ── Frame recording ────────────────────────────────────────────────────
+    # ── Frame recording ──────────────────────────────────────────────────────
 
     def _record_step(self, qpos: torch.Tensor):
         self._step_counter += 1
@@ -236,18 +220,15 @@ class SO101Oracle:
         if self.cameras is None:
             return
 
-        # ── Training frame ──────────────────────────────────────────────────
-        frame = {}
+        frame  = {}
         ATTACHED = {"wrist"}
 
         for role, cam in self.cameras.items():
             if role in ATTACHED:
                 cam.move_to_attach()
-            rgb, _, _, _ = cam.render()                      # uint8 [H, W, 3]
-
-            cam_key = _CAM_REMAP.get(role, role)             # e.g. "camera1"
-            # Apply blackout perturbation if configured
-            rgb = self.perturbation.apply_blackout(rgb, cam_key)
+            rgb, _, _, _ = cam.render()
+            cam_key      = _CAM_REMAP.get(role, role)
+            rgb          = self.perturbation.apply_blackout(rgb, cam_key)
             frame[f"observation.images.{cam_key}"] = rgb
 
         actual_qpos = self.robot.get_dofs_position()
@@ -256,7 +237,6 @@ class SO101Oracle:
         frame["task"]              = self.language_instruction
         self._frames.append(frame)
 
-        # ── Witness frame (high-res, no blackout) ───────────────────────────
         if self.witness_cameras:
             wf = {}
             for w_role, w_cam in self.witness_cameras.items():
@@ -266,11 +246,11 @@ class SO101Oracle:
                 wf[w_role] = rgb_w
             self._witness_frames.append(wf)
 
-    # ── Segment execution ──────────────────────────────────────────────────
+    # ── Segment execution ────────────────────────────────────────────────────
 
     def _execute_segment(self, target_cart_pos, gripper_target, settle_steps,
                          prev_qpos, cube, target_zone, table_height,
-                         check_sub_goals_fn, latch: dict):
+                         check_sub_goals_fn, latch):
         cfg = self.cfg
         noisy_quat = self._perturb_quat_z(
             self.grasp_quat, self._rng.normal(0, cfg.rot_noise_sigma)
@@ -298,11 +278,9 @@ class SO101Oracle:
         for interp_qpos in interp_configs:
             if _step(interp_qpos):
                 return interp_qpos, True
-
         for _ in range(settle_steps):
             if _step(target_qpos):
                 return target_qpos, True
-
         return target_qpos, False
 
     def _execute_release_segment(self, target_cart_pos, settle_steps,
@@ -353,13 +331,12 @@ class SO101Oracle:
 
         return is_success_fn(cube, target_zone, table_height)
 
-    # ── Waypoint computation ──────────────────────────────────────────────
+    # ── Waypoint computation ─────────────────────────────────────────────────
 
     def _compute_waypoints(self, cube_pos, target_pos, table_height):
         cfg            = self.cfg
         gripper_length = 0.06
-        x_offset       = 0.016
-        y_offset       = -0.000
+        x_offset, y_offset = 0.016, -0.000
 
         wp0 = cube_pos   + np.array([x_offset, y_offset, cfg.pregrasp_clearance + gripper_length])
         wp1 = cube_pos   + np.array([x_offset, y_offset, 0.01 + gripper_length])
@@ -391,65 +368,39 @@ class SO101Oracle:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Witness video writer
+#  Witness video writer  (unchanged)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _save_witness_video(
-    witness_frames: list[dict],
-    episode_id: int,
-    success: bool,
-    witness_dir: Path,
-    fps: int = 10,
-    prefix: str = "episode_",
-):
-    """
-    Save one high-res MP4 per witness camera for a single episode.
-
-    Output files:
-        <witness_dir>/context/<prefix><id:04d>_{pass|fail}.mp4
-        <witness_dir>/wrist/<prefix><id:04d>_{pass|fail}.mp4   (if present)
-        <witness_dir>/top/<prefix><id:04d>_{pass|fail}.mp4
-        <witness_dir>/combined/<prefix><id:04d>_{pass|fail}.mp4
-    """
+def _save_witness_video(witness_frames, episode_id, success, witness_dir,
+                         fps=10, prefix="episode_"):
     if not witness_frames:
         return
-
     label     = "pass" if success else "fail"
     stem      = f"{prefix}{episode_id:04d}_{label}"
-    cam_roles = list(witness_frames[0].keys())   # e.g. ["witness_context", "witness_top"]
+    cam_roles = list(witness_frames[0].keys())
 
     for role in cam_roles:
-        short = role.replace("witness_", "")     # "context", "wrist", "top"
+        short = role.replace("witness_", "")
         out   = witness_dir / short
         out.mkdir(parents=True, exist_ok=True)
+        frames_np = np.stack([wf[role] for wf in witness_frames])
+        iio.imwrite(str(out / f"{stem}.mp4"), frames_np, fps=fps,
+                    codec="libx264",
+                    output_params=["-crf", "18", "-pix_fmt", "yuv420p"])
 
-        frames_np = np.stack([wf[role] for wf in witness_frames])  # [T, H, W, 3]
-        iio.imwrite(
-            str(out / f"{stem}.mp4"),
-            frames_np,
-            fps=fps,
-            codec="libx264",
-            output_params=["-crf", "18", "-pix_fmt", "yuv420p"],
-        )
-
-    # Combined tile (side-by-side, whatever roles are available)
     combined_dir = witness_dir / "combined"
     combined_dir.mkdir(parents=True, exist_ok=True)
-    combined_frames = []
-    for wf in witness_frames:
-        row = np.concatenate([wf[r] for r in cam_roles], axis=1)   # tile horizontally
-        combined_frames.append(row)
-    iio.imwrite(
-        str(combined_dir / f"{stem}.mp4"),
-        np.stack(combined_frames),
-        fps=fps,
-        codec="libx264",
-        output_params=["-crf", "18", "-pix_fmt", "yuv420p"],
-    )
+    combined_frames = [
+        np.concatenate([wf[r] for r in cam_roles], axis=1)
+        for wf in witness_frames
+    ]
+    iio.imwrite(str(combined_dir / f"{stem}.mp4"), np.stack(combined_frames),
+                fps=fps, codec="libx264",
+                output_params=["-crf", "18", "-pix_fmt", "yuv420p"])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  collect_demonstrations  —  writes directly to LeRobot v3.0
+#  collect_demonstrations
 # ══════════════════════════════════════════════════════════════════════════════
 
 def collect_demonstrations(
@@ -461,56 +412,70 @@ def collect_demonstrations(
     table_height,
     is_success_fn,
     check_sub_goals_fn,
-    n_episodes: int              = 200,
-    output_dir: str              = "demos/lerobot/",
-    fps: int                     = FPS,
-    repo_id: str                 = "local/genesis_pickplace",
-    push_to_hub: bool            = False,
-    save_failures: bool          = True,
-    cube_color: str              = DEFAULT_CUBE_COLOR,
-    img_h: int                   = 256,
-    img_w: int                   = 256,
-    # New parameters -----------------------------------------------------------
-    witness_cameras: dict | None = None,
-    perturbation: CameraPerturbation = NOMINAL_PERTURBATION,
+    n_episodes: int                     = 200,
+    output_dir: str                     = "demos/lerobot/",
+    fps: int                            = FPS,
+    repo_id: str                        = "local/genesis_pickplace",
+    push_to_hub: bool                   = False,
+    save_failures: bool                 = True,
+    # Kept for backwards compat — ScenePerturbation takes precedence when set
+    cube_color: str                     = DEFAULT_CUBE_COLOR,
+    img_h: int                          = 256,
+    img_w: int                          = 256,
+    witness_cameras: dict | None        = None,
+    perturbation: CameraPerturbation    = NOMINAL_PERTURBATION,
+    # ── New parameters ──────────────────────────────────────────────────────
+    scene_perturbation: ScenePerturbation | None = None,
+    sphere_entities: list | None                 = None,
 ) -> list[bool]:
     """
-    Run the oracle for n_episodes, write training frames into a LeRobot v3.0
-    dataset, and optionally save high-res witness videos for human review.
+    Run the oracle for n_episodes and write directly into a LeRobot v3.0 dataset.
 
-    Parameters
-    ----------
-    witness_cameras : dict or None
-        High-res Genesis camera objects (from attach_witness_cameras_with_robot).
-        When supplied, one MP4 is written per camera per episode to
-        <output_dir>/../witness_videos/.
-        Pass None to disable witness recording.
-    perturbation : CameraPerturbation
-        Controls which training camera frames are blacked out before
-        being written into the dataset.  Position/tilt perturbations must
-        be pre-applied at attach_cameras() time in two_camera_setup.py.
+    New parameters
+    --------------
+    scene_perturbation : ScenePerturbation or None
+        When provided, controls:
+          • cube colour (and therefore the embedded language instruction)
+          • cube/target spawn position (fixed preset or randomised)
+          • which sphere presets are active
+        When None the function falls back to the legacy `cube_color` kwarg
+        and the oracle's built-in rejection-sampling spawn logic.
+
+    sphere_entities : list[gs.Entity] or None
+        Genesis entity handles returned by build_environment().  These are
+        repositioned at the start of each episode to their configured XY
+        locations.  Pass None (or []) if no spheres were added to the scene.
     """
-    cfg                  = OracleConfig()
-    language_instruction = language_instruction_for(cube_color)
-    oracle               = SO101Oracle(
+    # ── Resolve effective scene perturbation ─────────────────────────────────
+    if scene_perturbation is None:
+        scene_perturbation = ScenePerturbation(cube_color=cube_color)
+
+    eff_color = scene_perturbation.cube_color
+    print(f"[info] Scene perturbation : {scene_perturbation.label}")
+    print(f"[info] Cube colour        : {eff_color}")
+    if scene_perturbation.cube_position_preset:
+        print(f"[info] Cube position      : {scene_perturbation.cube_position_preset}")
+    if scene_perturbation.spheres:
+        print(f"[info] Distractor spheres : "
+              f"{[s.label for s in scene_perturbation.spheres]}")
+
+    cfg    = OracleConfig()
+    oracle = SO101Oracle(
         so101, scene, cameras,
         witness_cameras=witness_cameras,
         perturbation=perturbation,
         cfg=cfg,
-        language_instruction=language_instruction,
+        language_instruction=scene_perturbation.language_instruction,
     )
     features = make_features(img_h, img_w)
-
     out_dir  = Path(output_dir).resolve()
     fail_dir = out_dir.parent / "failures_lerobot"
 
-    # Witness video output dir  (always at a fixed location relative to out_dir)
     witness_dir = out_dir.parent / "witness_videos"
     if witness_cameras:
         witness_dir.mkdir(parents=True, exist_ok=True)
-        print(f"[info] Witness videos will be written to: {witness_dir}")
 
-    print(f"[info] Creating LeRobot v3.0 dataset at: {out_dir}")
+    print(f"[info] Writing dataset to : {out_dir}")
     dataset = LeRobotDataset.create(
         repo_id=repo_id, fps=fps, root=str(out_dir),
         features=features, use_videos=True, image_writer_threads=4,
@@ -518,42 +483,57 @@ def collect_demonstrations(
 
     fail_dataset = None
     if save_failures:
-        print(f"[info] Creating failures dataset at: {fail_dir}")
         fail_dataset = LeRobotDataset.create(
             repo_id=repo_id + "_failures", fps=fps, root=str(fail_dir),
             features=features, use_videos=True, image_writer_threads=4,
         )
 
-    home_pose = np.zeros(so101.n_dofs)
+    home_pose  = np.zeros(so101.n_dofs)
+    rng        = np.random.default_rng()
     results: list[bool] = []
     successes  = 0
     saved_ep   = 0
     saved_fail = 0
 
+    # Sphere configs for repositioning (empty list if no spheres)
+    sphere_cfgs = scene_perturbation.spheres if scene_perturbation else []
+
     print(f"\nCollecting {n_episodes} episodes  "
-          f"(fps={fps}, perturbation={perturbation.label})\n")
+          f"(fps={fps}, perturbation={perturbation.label}, "
+          f"scene={scene_perturbation.label})\n")
 
     for ep in range(n_episodes):
-        MIN_SEP = 0.12
-        for _ in range(50):
-            cube_xy   = np.array([0.24, 0.00])  + np.random.uniform(-0.04,  0.04, 2)
-            target_xy = np.array([0.15, -0.15]) + np.random.uniform(-0.05,  0.05, 2)
-            if np.linalg.norm(cube_xy - target_xy) >= MIN_SEP:
-                break
+        # ── Resolve spawn positions ─────────────────────────────────────────
+        cube_xy, target_xy = scene_perturbation.resolve_spawn(rng)
 
+        # ── Reset robot ─────────────────────────────────────────────────────
         so101.set_dofs_position(home_pose)
         so101.set_dofs_velocity(np.zeros(so101.n_dofs))
         so101.control_dofs_position(home_pose)
+
+        # ── Reset cube and target ────────────────────────────────────────────
         cube.set_pos(np.array([cube_xy[0], cube_xy[1], table_height + 0.015]))
         cube.set_quat(np.array([1.0, 0.0, 0.0, 0.0]))
         target_zone.set_pos(np.array([target_xy[0], target_xy[1], table_height + 0.001]))
+
+        # ── Reposition distractor spheres ────────────────────────────────────
+        if sphere_entities and sphere_cfgs:
+            for entity, cfg_s in zip(sphere_entities, sphere_cfgs):
+                z = table_height + cfg_s.radius
+                entity.set_pos(np.array([cfg_s.xy[0], cfg_s.xy[1], z]))
+                entity.set_quat(np.array([1.0, 0.0, 0.0, 0.0]))
+
+        # ── Settle ───────────────────────────────────────────────────────────
         for _ in range(20):
             so101.set_dofs_velocity(np.zeros(so101.n_dofs))
             so101.control_dofs_position(home_pose)
             scene.step()
 
+        # ── Run oracle ───────────────────────────────────────────────────────
         success = oracle.run_episode(
-            cube, target_zone, table_height, is_success_fn, check_sub_goals_fn,
+            cube, target_zone, table_height,
+            is_success_fn, check_sub_goals_fn,
+            language_instruction=scene_perturbation.language_instruction,
         )
 
         label   = "PASS ✓" if success else "FAIL ✗"
@@ -564,26 +544,18 @@ def collect_demonstrations(
         results.append(success)
 
         if not frames:
-            print(f"           [warn] no frames recorded — skipping")
+            print("           [warn] no frames recorded — skipping")
             continue
 
-        # ── Write training frames into the LeRobot dataset ─────────────────
         target_ds = dataset if success else fail_dataset
         if target_ds is not None:
             for frame in frames:
                 target_ds.add_frame(frame)
             target_ds.save_episode()
 
-        # ── Write witness video ────────────────────────────────────────────
         if witness_cameras and wframes:
             ep_index = saved_ep if success else saved_fail
-            _save_witness_video(
-                wframes,
-                episode_id=ep_index,
-                success=success,
-                witness_dir=witness_dir,
-                fps=fps,
-            )
+            _save_witness_video(wframes, ep_index, success, witness_dir, fps=fps)
 
         if success:
             successes += 1
@@ -591,26 +563,26 @@ def collect_demonstrations(
         else:
             saved_fail += 1
 
-    # ── Finalize ────────────────────────────────────────────────────────────
-    print(f"\n[info] Finalizing dataset (flushing parquet writers)…")
+    # ── Finalize ─────────────────────────────────────────────────────────────
+    print("\n[info] Finalizing dataset …")
     dataset.finalize()
     if fail_dataset is not None:
         fail_dataset.finalize()
 
     if push_to_hub:
-        print(f"[info] Pushing to Hub as '{repo_id}' …")
         dataset.push_to_hub()
         if fail_dataset is not None:
             fail_dataset.push_to_hub()
 
     print(f"\n{'─' * 50}")
-    print(f"Collection complete: {successes}/{n_episodes} successful "
+    print(f"Collection complete : {successes}/{n_episodes} "
           f"({successes / max(n_episodes, 1):.1%})")
-    print(f"Dataset written to : {out_dir}")
+    print(f"Scene perturbation  : {scene_perturbation.label}")
+    print(f"Dataset written to  : {out_dir}")
     if save_failures:
-        print(f"Failures written to: {fail_dir}")
+        print(f"Failures written to : {fail_dir}")
     if witness_cameras:
-        print(f"Witness videos     : {witness_dir}")
+        print(f"Witness videos      : {witness_dir}")
     print(f"{'─' * 50}")
 
     return results
