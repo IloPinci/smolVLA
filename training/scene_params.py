@@ -276,13 +276,13 @@ class ScenePerturbation:
 
         # Normal randomised spawn (same distribution as the oracle)
         for _ in range(max_tries):
-            cube_xy   = np.array([0.25, 0.00]) + rng.uniform(-0.05,  0.05, 2)
-            target_xy = np.array([0.15, -0.15]) + rng.uniform(-0.06,  0.06, 2)
+            cube_xy   = np.array([0.24, 0.00]) + rng.uniform(-0.04,  0.04, 2)
+            target_xy = np.array([0.15, -0.15]) + rng.uniform(-0.05,  0.05, 2)
             if np.linalg.norm(cube_xy - target_xy) >= min_sep:
                 return cube_xy, target_xy
 
         # Fallback if rejection sampling exhausted (should be extremely rare)
-        return np.array([0.25, 0.00]), np.array([0.15, -0.15])
+        return np.array([0.24, 0.00]), np.array([0.15, -0.15])
 
 
 # Convenience: the nominal (no scene perturbation) instance

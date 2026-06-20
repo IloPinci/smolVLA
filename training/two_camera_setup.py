@@ -116,7 +116,7 @@ def build_environment(
     cube = scene.add_entity(
         gs.morphs.Box(
             size=(0.03, 0.03, 0.03),
-            pos=(0.25, 0.0, table_height + 0.015),
+            pos=(0.24, 0.0, table_height + 0.015),
         ),
         material=gs.materials.Rigid(
             rho=1000.0,
@@ -396,7 +396,7 @@ def reset_episode(
     so101.set_dofs_position(home_dofs)
     so101.set_dofs_velocity(np.zeros(so101.n_dofs))
     so101.control_dofs_position(home_dofs)
-    cube.set_pos(torch.tensor([0.25, 0.0, table_height + 0.015]))
+    cube.set_pos(torch.tensor([0.24, 0.0, table_height + 0.015]))
     cube.set_quat(np.array([1.0, 0.0, 0.0, 0.0]))
 
     # Reposition distractor spheres
