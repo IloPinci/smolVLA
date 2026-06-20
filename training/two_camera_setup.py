@@ -514,7 +514,7 @@ def main():
         so101=so101, scene=scene,
         cameras=training_cams, witness_cameras=witness_cams,
         cube=cube, target_zone=target_zone,
-        sphere_entities=sphere_entities, sphere_configs=scene_pert.spheres,
+        sphere_entities=sphere_entities,
         table_height=table_height,
         is_success_fn=success_fn, check_sub_goals_fn=sub_goals_fn,
         n_episodes=200,
