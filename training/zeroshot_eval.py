@@ -245,9 +245,65 @@ MAX_STEPS    = 50       # ~30 frames per oracle episode; 50 gives slight extra m
 HOLD_STEPS   = 10   # must match oracle's record_every_n_steps
 ARM_DOFS     = np.arange(5)
 GRIPPER_DOF  = np.array([5])
-RECORD_EVERY = 5   # save 1 frame per 5 steps → ~600 frames max per episode
+RECORD_EVERY = 1   # save 1 frame per 5 steps → ~600 frames max per episode
+GRIPPER_CLOSE_TARGET = 0.18
 
-def _save_episode_videos(r: dict, tag: str, video_dir: Path, fps: int = 15):
+
+class GraspDetector:
+    """
+    Privileged (simulator ground-truth) grasp detector for diagnostics only.
+    Never seen by the policy — same role as check_sub_goals(), just stricter.
+
+    A step counts as "grasped" only when ALL of:
+      - gripper DOF is actually closed (not mid-transition)
+      - cube is elevated above the table
+      - cube's position relative to the jaw has stayed stable over `window`
+        consecutive steps (i.e. it's moving WITH the jaw, not just near it)
+    """
+    def __init__(self, table_height, jaw_link_name="moving_jaw_so101_v1",
+                 gripper_close_target=GRIPPER_CLOSE_TARGET, gripper_closed_tol=0.05,
+                 near_radius=0.08, elevation_thresh=0.02,
+                 window=5, rel_pos_tol=0.01):
+        self.table_height         = table_height
+        self.jaw_link_name        = jaw_link_name
+        self.gripper_close_target = gripper_close_target
+        self.gripper_closed_tol   = gripper_closed_tol
+        self.near_radius          = near_radius
+        self.elevation_thresh     = elevation_thresh
+        self.window               = window
+        self.rel_pos_tol          = rel_pos_tol
+        self._rel_pos_history     = []
+
+    def reset(self):
+        self._rel_pos_history = []
+
+    def step(self, so101, cube):
+        jaw_pos   = so101.get_link(self.jaw_link_name).get_pos()
+        cube_pos  = cube.get_pos()
+        gripper_q = so101.get_dofs_position()[5].item()
+
+        dist        = torch.norm(jaw_pos - cube_pos).item()
+        near        = dist < self.near_radius
+        is_closed   = abs(gripper_q - self.gripper_close_target) < self.gripper_closed_tol
+        is_elevated = cube_pos[2].item() > (self.table_height + self.elevation_thresh)
+
+        rel_pos = (cube_pos - jaw_pos).cpu().numpy()
+        self._rel_pos_history.append(rel_pos)
+        if len(self._rel_pos_history) > self.window:
+            self._rel_pos_history.pop(0)
+
+        co_moving = False
+        if len(self._rel_pos_history) == self.window:
+            spread    = np.std(self._rel_pos_history, axis=0).max()
+            co_moving = spread < self.rel_pos_tol
+
+        grasped = is_closed and is_elevated and co_moving
+        return {
+            "near": near, "grasped": grasped, "dist": dist,
+            "is_closed": is_closed, "is_elevated": is_elevated, "co_moving": co_moving,
+        }
+
+def _save_episode_videos(r: dict, tag: str, video_dir: Path, fps: int = 10):
     """
     Save three side-by-side MP4s per episode:
       <tag>_context.mp4   — context (third-person) camera
@@ -283,6 +339,8 @@ def run_rollout(agent, scene, so101, cube, target_zone,
         action[6]   — gripper absolute position (we use this for control)
     """
     agent.reset()
+    grasp_detector = GraspDetector(table_height=table_height)
+    grasp_detector.reset()
     latch = {"lifted": False, "reached": False}
 
     top_cam     = cameras["top"]
@@ -327,12 +385,17 @@ def run_rollout(agent, scene, so101, cube, target_zone,
             so101.control_dofs_position(gripper_target, dofs_idx_local=gripper_dof)
             scene.step()
 
-        # ── Sub-goals — latch reached just like oracle latches lifted ─────────
-        sg = check_sub_goals(so101, cube, target_zone, table_height, _latch=latch)
-        if sg["near_block"]:
+        # ── Sub-goals ───────────────────────────────────────────────────────
+        sg = check_sub_goals(so101, cube, target_zone, table_height)   # only "placed" is used now
+        gd = grasp_detector.step(so101, cube)
+
+        if gd["near"]:
             latch["reached"] = True
+        if gd["grasped"]:
+            latch["grasped"] = True
+
         reached = latch["reached"]
-        lifted  = latch["lifted"]
+        lifted  = latch["grasped"]   # ← "lifted" now means a verified grasp, not bare elevation
         placed  = sg["placed"]
 
         if placed:

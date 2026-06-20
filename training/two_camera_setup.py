@@ -1,9 +1,60 @@
+"""
+two_camera_setup.py
+-------------------
+Scene construction, camera attachment, and success-check helpers.
+
+Camera architecture
+-------------------
+TRAINING cameras  (returned by attach_cameras)
+    Rendered at IMG_RES (256×256), written into the LeRobot dataset /
+    passed to the policy.  Subject to all CameraPerturbation axes:
+        • position shift   — camera physically moved in the scene
+        • tilt             — look direction rotated around world-Z
+        • blackout         — rendered frame zeroed out post-render
+
+WITNESS cameras   (returned by attach_witness_cameras)
+    Rendered at WITNESS_RES (1280×720), NEVER written to the dataset or
+    passed to the policy.  Always record the true, unperturbed view so
+    you can visually verify episodes.  These are separate Genesis camera
+    objects placed at fixed nominal world positions.
+
+Usage
+-----
+    from two_camera_setup import (
+        build_environment, attach_cameras, attach_witness_cameras,
+        is_success, check_sub_goals, reset_episode,
+    )
+    from scene_params import CameraPerturbation
+
+    # nominal training cameras (no perturbation)
+    training_cams = attach_cameras(scene, so101, table_height)
+
+    # perturbed training cameras
+    pert = CameraPerturbation(
+        blackout_mode="wrist_only",
+        position_target="context",
+        position_offset=(0.05, 0.0, 0.0),
+        tilt_target="context",
+        tilt_deg=10.0,
+    )
+    training_cams = attach_cameras(scene, so101, table_height, perturbation=pert)
+
+    # always-on high-res witness cameras
+    witness_cams = attach_witness_cameras(scene, table_height)
+"""
+
 import os
 import numpy as np
 import genesis as gs
 import torch
-from oracle_direct import SO101Oracle, OracleConfig, collect_demonstrations
-from scene_params import CUBE_COLORS, DEFAULT_CUBE_COLOR, IMG_RES
+
+from scene_params import (
+    CUBE_COLORS, DEFAULT_CUBE_COLOR, IMG_RES, WITNESS_RES,
+    CameraPerturbation, NOMINAL_PERTURBATION,
+)
+
+# Internal mapping: oracle/camera role string → LeRobot key suffix
+_ROLE_TO_CAM_KEY = {"context": "camera1", "wrist": "camera2", "top": "camera3"}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -69,114 +120,301 @@ def build_environment(scene, table_height, cube_color: str = DEFAULT_CUBE_COLOR)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Cameras
+#  Nominal camera positions / lookat targets
+#  (single source of truth so witness cameras can mirror them exactly)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def attach_cameras(scene, so101, table_height,
-                    context_offset: tuple[float, float, float] = (0.0, 0.0, 0.0),
-                    context_tilt_deg: float = 0.0):
+def _context_nominal(table_height: float):
+    pos    = np.array([0.4, -0.4, table_height + 0.55])
+    lookat = np.array([0.2,  0.0, table_height + 0.05])
+    return pos, lookat
+
+
+def _top_nominal(table_height: float):
+    pos    = np.array([0.0, 0.0, table_height + 1.0])
+    lookat = np.array([0.0, 0.0, table_height + 0.1])
+    return pos, lookat
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Training cameras  (subject to CameraPerturbation)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def attach_cameras(
+    scene,
+    so101,
+    table_height: float,
+    perturbation: CameraPerturbation = NOMINAL_PERTURBATION,
+    # Legacy kwargs kept for backwards compatibility — ignored when
+    # a CameraPerturbation is supplied instead.
+    context_offset: tuple = (0.0, 0.0, 0.0),
+    context_tilt_deg: float = 0.0,
+) -> dict:
     """
-    Two cameras that match the SmolVLA training distribution:
+    Add the three TRAINING cameras to the scene and return them as a dict.
 
-    context_cam  — fixed third-person view from the front-right of the table.
-                   Sees the full workspace: arm, cube, and target zone.
+    Keys returned: {"context": <cam>, "wrist": <cam>, "top": <cam>}
 
-    wrist_cam    — attached to the gripper link, offset to the SIDE so it
-                   looks horizontally at the jaw tips and the object being
-                   grasped.  The offset_T below places it ~8 cm to the right
-                   of the gripper centreline and ~4 cm behind the jaw tips,
-                   rotated so it looks forward (toward the cube).
+    These cameras render at IMG_RES (256×256) and are passed to both the
+    oracle recorder and the policy agent.  All CameraPerturbation axes
+    (position shift, tilt, blackout) are supported here; blackout is
+    applied *post-render* by the caller using perturbation.apply_blackout().
 
+    Parameters
+    ----------
+    perturbation : CameraPerturbation
+        If supplied, overrides the legacy context_offset / context_tilt_deg
+        kwargs.  Use CameraPerturbation() for the nominal (unperturbed) case.
+    context_offset : tuple (dx, dy, dz)
+        Legacy — kept for callers that haven't migrated.  Ignored when
+        perturbation.position_target is not None.
+    context_tilt_deg : float
+        Legacy — kept for backwards compatibility.
     """
 
-    # ── Context camera (fixed, world frame) ──────────────────────────────────
+    # ── Context camera ───────────────────────────────────────────────────────
+    ctx_pos_nom, ctx_look_nom = _context_nominal(table_height)
 
-    # Nominal pose, unchanged from the original hardcoded values.
-    context_pos_nominal    = np.array([0.4, -0.4, table_height + 0.55])
-    context_lookat_nominal = np.array([0.2, 0.0,  table_height + 0.05])
-
-    # context_offset translates the camera position. Default (0,0,0) leaves
-    # pos exactly at the nominal value.
-    context_pos = context_pos_nominal + np.array(context_offset, dtype=float)
-
-   # context_tilt_deg rotates the LOOK DIRECTION (about world Z) from the
-    # (possibly offset) camera position. Default 0.0 leaves the look target
-    # at the nominal point, so pos==nominal + tilt==0 reproduces the
-    # original camera exactly.
-    if context_tilt_deg:
-        look_vec = context_lookat_nominal - context_pos_nominal
-        theta = np.radians(context_tilt_deg)
-        c, s = np.cos(theta), np.sin(theta)
-        rot_z = np.array([[c, -s, 0.0],
-                          [s,  c, 0.0],
-                          [0.0, 0.0, 1.0]])
-        look_vec = rot_z @ look_vec
-        context_lookat = context_pos + look_vec
+    # Resolve position offset: new CameraPerturbation takes priority,
+    # then fall back to legacy context_offset kwarg.
+    pert_ctx_offset = perturbation.position_offset_for("context")
+    if any(v != 0.0 for v in pert_ctx_offset):
+        ctx_pos = ctx_pos_nom + np.array(pert_ctx_offset, dtype=float)
     else:
-        context_lookat = context_lookat_nominal
+        ctx_pos = ctx_pos_nom + np.array(context_offset, dtype=float)
+
+    # Resolve tilt: new CameraPerturbation takes priority.
+    pert_ctx_tilt = perturbation.tilt_deg_for("context")
+    ctx_tilt_deg  = pert_ctx_tilt if pert_ctx_tilt != 0.0 else context_tilt_deg
+
+    ctx_lookat = _apply_tilt(ctx_pos, ctx_pos_nom, ctx_look_nom, ctx_tilt_deg)
 
     context_cam = scene.add_camera(
         res=IMG_RES,
-        pos=tuple(context_pos),
-        lookat=tuple(context_lookat),
+        pos=tuple(ctx_pos),
+        lookat=tuple(ctx_lookat),
         fov=60,
         GUI=False,
     )
-    
-    #! Camera top — fixed, world frame, not rendered yet but ready to use
+
+    # ── Top camera ───────────────────────────────────────────────────────────
+    top_pos_nom, top_look_nom = _top_nominal(table_height)
+
+    top_offset = np.array(perturbation.position_offset_for("top"), dtype=float)
+    top_pos    = top_pos_nom + top_offset
+
+    top_tilt_deg = perturbation.tilt_deg_for("top")
+    top_lookat   = _apply_tilt(top_pos, top_pos_nom, top_look_nom, top_tilt_deg)
+
     top_cam = scene.add_camera(
         res=IMG_RES,
-        pos=(0.0, 0.0, table_height + 1.0),
-        lookat=(0.0, 0.0, table_height + 0.1),
+        pos=tuple(top_pos),
+        lookat=tuple(top_lookat),
         fov=65,
         GUI=False,
     )
 
     # ── Wrist camera (attached to gripper link) ───────────────────────────────
-    # We create the camera at a dummy world position; attach() overrides it.
+    # Created at a dummy world position; attach() overrides it at render time.
+    # Position offset for "wrist" shifts the local offset_T translation so
+    # the camera sits at a different position relative to the gripper link.
     wrist_cam = scene.add_camera(
         res=IMG_RES,
-        pos=(0.0, 0.0, 0.0),   # placeholder — will be overridden by attach()
+        pos=(0.0, 0.0, 0.0),
         lookat=(1.0, 0.0, 0.0),
         fov=50,
-        GUI=False,              # shows in the Genesis viewer window
+        GUI=False,
     )
 
     gripper_link = so101.get_link("gripper")
 
-    # offset_T: 4×4 transform of the camera in the gripper link's local frame.
-    #
-    # Layout of the SO-101 gripper (looking from above):
-    #   +X  →  forward (along jaw opening direction)
-    #   +Y  →  left of the arm
-    #   +Z  →  up
-    #
-    # We place the camera:
-    #   - 8 cm to the RIGHT  (+Y = -0.08 in local frame, since right = -Y)
-    #   - 3 cm BEHIND the jaw tips  (-X = -0.03)
-    #   - 2 cm ABOVE the jaw midpoint (+Z = +0.02)
-    # Then rotate it 90° about the local Z axis so its optical axis points
-    # forward (+X) and the "up" vector is local +Z.
-    #
-    # Rotation: camera looks in local +X direction.
-    # In Genesis attach(), the transform rotates the camera's default
-    # "looking toward -Z" into the desired orientation.
-    # A 90° rotation about local Y maps -Z → +X.
+    # Base offset in the gripper link's local frame
+    base_translation = np.array([0.01, -0.145, -0.062])
+    wrist_offset     = np.array(perturbation.position_offset_for("wrist"), dtype=float)
+    final_translation = base_translation + wrist_offset
+
+    # Tilt for the wrist camera: rotate around the gripper link's local Z axis
+    wrist_tilt_deg = perturbation.tilt_deg_for("wrist")
+
     theta = np.radians(90)
-    c = np.cos(theta)
-    s = np.sin(theta)
+    c, s  = np.cos(theta), np.sin(theta)
     rotation = np.array([
-        [ 1.0, 0.0,  0.0, 0.0],
-        [ 0.0,   c,   -s, 0.0],
-        [ 0.0,   s,    c, 0.0],
-        [ 0.0, 0.0,  0.0, 1.0],
+        [1.0, 0.0,  0.0, 0.0],
+        [0.0,   c,   -s, 0.0],
+        [0.0,   s,    c, 0.0],
+        [0.0, 0.0,  0.0, 1.0],
     ])
+
+    if wrist_tilt_deg != 0.0:
+        rotation = _rotate_4x4_z(rotation, wrist_tilt_deg)
+
     offset_T = rotation.copy()
-    offset_T[:3, 3] = np.array([0.01, -0.145, -0.062])   # as it is fixed on the non moving gripper
+    offset_T[:3, 3] = final_translation
 
     wrist_cam.attach(gripper_link, offset_T)
 
-    return {"context": context_cam, "wrist": wrist_cam, "top": top_cam}
+    cams = {"context": context_cam, "wrist": wrist_cam, "top": top_cam}
+
+    # Log what was applied so it shows up in stdout when running experiments
+    if perturbation.label != "nominal":
+        print(f"[camera perturbation] {perturbation.label}")
+
+    return cams
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Witness cameras  (high-res, always nominal, never in the dataset)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def attach_witness_cameras(scene, table_height: float) -> dict:
+    """
+    Add three high-resolution WITNESS cameras at fixed nominal positions.
+
+    These cameras:
+    • Render at WITNESS_RES (1280×720) — suitable for human review.
+    • Are NEVER passed to the oracle recorder or the policy agent.
+    • Are NEVER written into the LeRobot dataset.
+    • Always record the true, unperturbed view of the scene.
+
+    Keys returned: {"witness_context": <cam>, "witness_wrist": <cam>,
+                    "witness_top": <cam>}
+
+    Call attach_witness_cameras() AFTER attach_cameras() and BEFORE
+    scene.build() so Genesis can allocate all cameras together.
+    """
+    ctx_pos, ctx_lookat = _context_nominal(table_height)
+    top_pos, top_lookat = _top_nominal(table_height)
+
+    w_context = scene.add_camera(
+        res=WITNESS_RES,
+        pos=tuple(ctx_pos),
+        lookat=tuple(ctx_lookat),
+        fov=60,
+        GUI=False,
+    )
+
+    w_top = scene.add_camera(
+        res=WITNESS_RES,
+        pos=tuple(top_pos),
+        lookat=tuple(top_lookat),
+        fov=65,
+        GUI=False,
+    )
+
+    # Witness wrist: use the same nominal local-frame offset as the training
+    # wrist cam but at the higher resolution.
+    w_wrist = scene.add_camera(
+        res=WITNESS_RES,
+        pos=(0.0, 0.0, 0.0),
+        lookat=(1.0, 0.0, 0.0),
+        fov=50,
+        GUI=False,
+    )
+    # We need so101 to attach the wrist witness.  Pass it via the scene's
+    # robot list — callers who want the witness wrist must call
+    # attach_witness_cameras_with_robot() instead.
+    # The plain attach_witness_cameras() omits the wrist witness to keep
+    # the API simple for cases without a robot handle.
+
+    print(f"[witness cameras] context + top at {WITNESS_RES[1]}×{WITNESS_RES[0]} "
+          f"(wrist witness requires attach_witness_cameras_with_robot)")
+
+    return {"witness_context": w_context, "witness_top": w_top}
+
+
+def attach_witness_cameras_with_robot(scene, so101, table_height: float) -> dict:
+    """
+    Full three-camera witness rig including an attached wrist camera.
+
+    Returns {"witness_context", "witness_wrist", "witness_top"}.
+    Must be called BEFORE scene.build().
+    """
+    ctx_pos, ctx_lookat = _context_nominal(table_height)
+    top_pos, top_lookat = _top_nominal(table_height)
+
+    w_context = scene.add_camera(
+        res=WITNESS_RES,
+        pos=tuple(ctx_pos),
+        lookat=tuple(ctx_lookat),
+        fov=60,
+        GUI=False,
+    )
+
+    w_top = scene.add_camera(
+        res=WITNESS_RES,
+        pos=tuple(top_pos),
+        lookat=tuple(top_lookat),
+        fov=65,
+        GUI=False,
+    )
+
+    w_wrist = scene.add_camera(
+        res=WITNESS_RES,
+        pos=(0.0, 0.0, 0.0),
+        lookat=(1.0, 0.0, 0.0),
+        fov=50,
+        GUI=False,
+    )
+
+    gripper_link = so101.get_link("gripper")
+    theta = np.radians(90)
+    c, s  = np.cos(theta), np.sin(theta)
+    rotation = np.array([
+        [1.0, 0.0,  0.0, 0.0],
+        [0.0,   c,   -s, 0.0],
+        [0.0,   s,    c, 0.0],
+        [0.0, 0.0,  0.0, 1.0],
+    ])
+    offset_T       = rotation.copy()
+    offset_T[:3, 3] = np.array([0.01, -0.145, -0.062])
+    w_wrist.attach(gripper_link, offset_T)
+
+    print(f"[witness cameras] context + wrist + top at {WITNESS_RES[1]}×{WITNESS_RES[0]}")
+    return {"witness_context": w_context, "witness_wrist": w_wrist, "witness_top": w_top}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Geometry helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _apply_tilt(
+    cam_pos: np.ndarray,
+    nominal_cam_pos: np.ndarray,
+    nominal_lookat: np.ndarray,
+    tilt_deg: float,
+) -> np.ndarray:
+    """
+    Rotate the look direction around world-Z by tilt_deg.
+
+    The look vector is computed from the *nominal* camera position, so the
+    rotation is always consistent regardless of any position offset that may
+    have been applied.  Returns the new lookat point.
+    """
+    if tilt_deg == 0.0:
+        return nominal_lookat.copy()
+    look_vec = nominal_lookat - nominal_cam_pos
+    theta    = np.radians(tilt_deg)
+    c, s     = np.cos(theta), np.sin(theta)
+    rot_z    = np.array([[c, -s, 0.0],
+                          [s,  c, 0.0],
+                          [0.0, 0.0, 1.0]])
+    return cam_pos + rot_z @ look_vec
+
+
+def _rotate_4x4_z(mat: np.ndarray, deg: float) -> np.ndarray:
+    """
+    Apply an additional rotation around local Z to a 4×4 homogeneous matrix.
+    Used to tilt the wrist camera's orientation within its gripper-local frame.
+    """
+    theta = np.radians(deg)
+    c, s  = np.cos(theta), np.sin(theta)
+    rz = np.array([
+        [ c, -s, 0.0, 0.0],
+        [ s,  c, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ])
+    return rz @ mat
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -193,30 +431,25 @@ def is_success(cube, target_zone, table_height, radius=0.05, min_height=0.005):
     return bool(on_target and above_table and not_airborne)
 
 
-def check_sub_goals(so101, cube, target_zone, table_height, radius=0.05, min_height=0.005, _latch: dict | None = None):
+def check_sub_goals(so101, cube, target_zone, table_height,
+                    radius=0.05, min_height=0.005, _latch: dict | None = None):
     """
     Evaluate per-step sub-goal completions.
- 
+
     Parameters
     ----------
     _latch : dict or None
         Mutable dict {"lifted": bool} shared across all calls within one
         episode.  Pass the same dict object every step so that `lifted`
         latches True once the block is elevated and never resets to False
-        mid-episode (which would otherwise happen the moment the gripper
-        moves away from the block toward the target zone).
- 
-        Pass None (or omit) to get unlatched per-step behaviour — useful
-        for single-step diagnostic calls outside an episode loop.
+        mid-episode.  Pass None for single-step diagnostic calls.
     """
-    cube_pos    = cube.get_pos()
-    gripper_pos = so101.get_link("gripper").get_pos()
+    cube_pos     = cube.get_pos()
+    gripper_pos  = so101.get_link("gripper").get_pos()
     gripper_dist = torch.norm(gripper_pos - cube_pos).item()
-    near_block  = gripper_dist < 0.05
-    is_elevated = cube_pos[2].item() > (table_height + 0.02)
+    near_block   = gripper_dist < 0.05
+    is_elevated  = cube_pos[2].item() > (table_height + 0.02)
 
-    # Latched lifted: once the block is off the table it counts for the
-    # rest of the episode, even after the gripper moves to the target zone.
     if _latch is not None:
         if is_elevated and near_block:
             _latch["lifted"] = True
@@ -224,7 +457,7 @@ def check_sub_goals(so101, cube, target_zone, table_height, radius=0.05, min_hei
     else:
         lifted = bool(is_elevated and near_block)
 
-    placed      = is_success(cube, target_zone, table_height, radius, min_height)
+    placed  = is_success(cube, target_zone, table_height, radius, min_height)
     partial = 0.2 * near_block + 0.4 * lifted + 1.0 * placed
     return {"near_block": near_block, "lifted": lifted, "placed": placed, "Sum": partial}
 
@@ -247,10 +480,25 @@ def reset_episode(scene, so101, cube, table_height, home_dofs=None):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Main
+#  Main (demonstration collection)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
+    """
+    Example: collect 200 demonstrations with nominal cameras + witness rig.
+
+    Swap in a CameraPerturbation to run a perturbed condition, e.g.:
+
+        pert = CameraPerturbation(
+            blackout_mode="wrist_only",
+            position_target="context",
+            position_offset=(0.0, 0.10, 0.0),
+        )
+        training_cams = attach_cameras(scene, so101, table_height,
+                                       perturbation=pert)
+    """
+    from oracle_direct import collect_demonstrations
+
     script_dir = os.path.dirname(os.path.abspath(__file__))
     xml_path   = os.path.join(script_dir, "../so101_arm/so101_new_calib.xml")
 
@@ -291,42 +539,39 @@ def main():
         gs.morphs.MJCF(file=xml_path, pos=(0.0, 0.0, table_height))
     )
 
-    # Cameras must be added before scene.build()
-    cameras = attach_cameras(scene, so101, table_height)
+    # ── Training cameras (nominal — no perturbation) ──────────────────────────
+    training_cams = attach_cameras(scene, so101, table_height)
+
+    # ── Witness cameras (high-res, always nominal) ────────────────────────────
+    witness_cams = attach_witness_cameras_with_robot(scene, so101, table_height)
 
     scene.build()
 
-    # ── Joint gains ───────────────────────────────────────────────────────────
+    # Joint gains
     arm_dofs = np.arange(5)
     so101.set_dofs_kp(np.array([4000, 4000, 3000, 2000, 2000]), dofs_idx_local=arm_dofs)
     so101.set_dofs_kv(np.array([400,  400,  300,  200,  200]),  dofs_idx_local=arm_dofs)
-
     gripper_dof = np.array([5])
     so101.set_dofs_kp(np.array([800.0]), dofs_idx_local=gripper_dof)
     so101.set_dofs_kv(np.array([80.0]),  dofs_idx_local=gripper_dof)
     so101.set_dofs_force_range(
-        lower=np.array([-100.0]),
-        upper=np.array([ 100.0]),
+        lower=np.array([-100.0]), upper=np.array([100.0]),
         dofs_idx_local=gripper_dof,
     )
-
-    # Gripper friction (must be set after build)
     for link_name in ["gripper", "moving_jaw_so101_v1"]:
         so101.get_link(link_name).set_friction(5.0)
 
-    # ── Wrappers with closed-over constants ───────────────────────────────────
     def success_fn(c, tz, th):
         return is_success(c, tz, th, radius=0.05, min_height=0.005)
 
     def sub_goals_fn(robot, c, tz, th, latch=None):
         return check_sub_goals(robot, c, tz, th, radius=0.05, min_height=0.005, _latch=latch)
 
-    # ── Collect demonstrations ────────────────────────────────────────────────
-    nominal_cameras = cameras 
     collect_demonstrations(
         so101=so101,
         scene=scene,
-        cameras=nominal_cameras,
+        cameras=training_cams,
+        witness_cameras=witness_cams,
         cube=cube,
         target_zone=target_zone,
         table_height=table_height,
