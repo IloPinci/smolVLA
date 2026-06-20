@@ -72,11 +72,11 @@ CUBE_POSITIONS: dict[str, dict] = {
     "nominal":        {"cube_xy": (0.25,  0.00), "target_xy": (0.15, -0.15)},
     # lateral shifts  (OOD)
     "near_left":      {"cube_xy": (0.20,  0.12), "target_xy": (0.15, -0.15)},
-    "far_left":       {"cube_xy": (0.32,  0.14), "target_xy": (0.15, -0.15)},
+    "far_left":       {"cube_xy": (0.30,  0.14), "target_xy": (0.15, -0.15)},
     "near_right":     {"cube_xy": (0.20, -0.13), "target_xy": (0.15, -0.15)},
-    "far_right":      {"cube_xy": (0.32, -0.14), "target_xy": (0.15, -0.15)},
+    "far_right":      {"cube_xy": (0.30, -0.14), "target_xy": (0.15, -0.15)},
     # reach extremes
-    "workspace_edge": {"cube_xy": (0.34,  0.00), "target_xy": (0.15, -0.15)},
+    "workspace_edge": {"cube_xy": (0.32,  0.00), "target_xy": (0.15, -0.15)},
     # target relocated
     "target_shift":   {"cube_xy": (0.25,  0.00), "target_xy": (0.05, -0.22)},
     # cube already close to the target (tests placing without long carry)
@@ -102,7 +102,7 @@ class SphereConfig:
         World-frame (x, y) centre position. The sphere is placed just
         above the table surface automatically by build_environment().
     radius : float
-        Sphere radius in metres.  0.02–0.04 m is visually salient but
+        Sphere radius in metres.  0.02-0.04 m is visually salient but
         small enough not to obstruct most grasps.
     color : (R, G, B) floats in [0, 1]
         Surface colour passed to gs.surfaces.Rough.

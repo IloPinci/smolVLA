@@ -94,7 +94,7 @@ def make_features(img_h: int = 256, img_w: int = 256) -> dict:
 @dataclass
 class OracleConfig:
     pos_noise_sigma:      float = 0.004
-    rot_noise_sigma:      float = np.deg2rad(2)
+    rot_noise_sigma:      float = np.deg2rad(1)
     steps_per_segment:    int   = 30
     pregrasp_clearance:   float = 0.12
     lift_height:          float = 0.15
