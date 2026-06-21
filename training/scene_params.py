@@ -309,7 +309,11 @@ def perturb_home_pose(
 # ══════════════════════════════════════════════════════════════════════════
 #  Camera blackout helpers
 # ══════════════════════════════════════════════════════════════════════════
-BLACKOUT_MODES = {"none", "3-cam", "3rd_black", "all_black", "wrist_only", "context_only"}
+BLACKOUT_MODES = {
+    "none", "3-cam", "3rd_black", "all_black",
+    "wrist_only", "context_only", "top_only",   # ← new: single-camera isolation
+    "no_top", "no_wrist", "no_context",         # ← new: two-camera combos
+}
 
 _CAM_ROLE = {"camera1": "context", "camera2": "wrist", "camera3": "top"}
 
@@ -317,7 +321,6 @@ _CAM_ROLE = {"camera1": "context", "camera2": "wrist", "camera3": "top"}
 def apply_camera_blackout(
     frame: np.ndarray, cam_key: str, mode: str = "none"
 ) -> np.ndarray:
-    """Zero out `frame` according to `mode`. cam_key is e.g. "camera1"."""
     if mode not in BLACKOUT_MODES:
         raise ValueError(f"Unknown camera_blackout_mode: {mode!r}")
     if mode in ("none", "3-cam"):
@@ -332,6 +335,17 @@ def apply_camera_blackout(
         return np.zeros_like(frame)
     if mode == "context_only" and role != "context":
         return np.zeros_like(frame)
+    if mode == "top_only" and role != "top":
+        return np.zeros_like(frame)
+
+    # two-camera combos: name says which ONE camera is blacked out
+    if mode == "no_top" and role == "top":
+        return np.zeros_like(frame)
+    if mode == "no_wrist" and role == "wrist":
+        return np.zeros_like(frame)
+    if mode == "no_context" and role == "context":
+        return np.zeros_like(frame)
+
     return frame
 
 

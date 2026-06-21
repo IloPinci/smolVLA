@@ -473,7 +473,9 @@ def main():
     # ── Camera perturbation ───────────────────────────────────────────────────
     parser.add_argument(
         "--blackout_mode", default="none",
-        choices=["none", "3-cam", "3rd_black", "all_black", "wrist_only", "context_only"],
+        choices=["none", "3-cam", "3rd_black", "all_black",
+             "wrist_only", "context_only", "top_only",
+             "no_top", "no_wrist", "no_context"],
     )
     parser.add_argument("--pos_target",  default=None,
                         choices=[None, "context", "wrist", "top"])
