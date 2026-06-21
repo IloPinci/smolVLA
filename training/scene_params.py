@@ -311,11 +311,19 @@ def perturb_home_pose(
 # ══════════════════════════════════════════════════════════════════════════
 BLACKOUT_MODES = {
     "none", "3-cam", "3rd_black", "all_black",
-    "wrist_only", "context_only", "top_only",   # ← new: single-camera isolation
-    "no_top", "no_wrist", "no_context",         # ← new: two-camera combos
+    "wrist_only", "context_only", "top_only",   
+    "no_top", "no_wrist", "no_context",
+    "absent_wrist", "absent_context", "absent_top",
+    "absent_all",         
 }
 
 _CAM_ROLE = {"camera1": "context", "camera2": "wrist", "camera3": "top"}
+
+def is_camera_absent(cam_key: str, mode: str) -> bool:
+    role = _CAM_ROLE.get(cam_key)
+    if mode == "absent_all":
+        return True
+    return mode == f"absent_{role}"
 
 
 def apply_camera_blackout(
@@ -394,6 +402,9 @@ class CameraPerturbation:
 
     def apply_blackout(self, frame: np.ndarray, cam_key: str) -> np.ndarray:
         return apply_camera_blackout(frame, cam_key, self.blackout_mode)
+
+    def camera_is_absent(self, cam_key: str) -> bool:
+        return is_camera_absent(cam_key, self.blackout_mode)
 
     def position_offset_for(self, role: str) -> Tuple[float, float, float]:
         if self.position_target == role:

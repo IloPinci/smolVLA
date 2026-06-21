@@ -63,6 +63,7 @@ from scene_params import (
     ScenePerturbation, NOMINAL_SCENE,
     CUBE_POSITIONS, SPHERE_PRESETS,
     SphereConfig,
+    BLACKOUT_MODES, 
 )
 
 import genesis as gs
@@ -127,8 +128,10 @@ class SmolVLAAgent:
 
     @torch.no_grad()
     def act(self, context_rgb, wrist_rgb, top_rgb, joint_state,
-            language_instruction: str | None = None):
+        language_instruction=None, absent_cameras: set[str] | None = None):
+
         instruction = language_instruction or self._default_instruction
+        absent_cameras = absent_cameras or set()
 
         def img_to_tensor(arr):
             t = torch.from_numpy(arr.copy()).float() / 255.0
@@ -140,14 +143,18 @@ class SmolVLAAgent:
             [instruction], return_tensors="pt",
             padding=True, truncation=True, max_length=64,
         )
-        obs = {
-            "observation.images.camera1":          img_to_tensor(context_rgb),
-            "observation.images.camera2":          img_to_tensor(wrist_rgb),
-            "observation.images.camera3":          img_to_tensor(top_rgb),
-            "observation.state":                   state_t,
-            "observation.language.tokens":         enc["input_ids"].to(self.device),
-            "observation.language.attention_mask": enc["attention_mask"].bool().to(self.device),
-        }
+        obs = {}
+
+        if "camera1" not in absent_cameras and context_rgb is not None:
+            obs["observation.images.camera1"] = img_to_tensor(context_rgb)
+        if "camera2" not in absent_cameras and wrist_rgb is not None:
+            obs["observation.images.camera2"] = img_to_tensor(wrist_rgb)
+        if "camera3" not in absent_cameras and top_rgb is not None:
+            obs["observation.images.camera3"] = img_to_tensor(top_rgb)
+        obs["observation.state"] = state_t
+        obs["observation.language.tokens"] = enc["input_ids"].to(self.device)
+        obs["observation.language.attention_mask"] = enc["attention_mask"].bool().to(self.device)
+
         action_t    = self.policy.select_action(obs)
         if action_t.ndim == 3:
             action_t = action_t[:, 0, :]
@@ -356,14 +363,22 @@ def run_rollout(
     lang_instr = scene_perturbation.language_instruction
 
     while step < MAX_STEPS:
-        ctx_rgb,   _, _, _ = context_cam.render()
-        wrist_cam.move_to_attach()
-        wrist_rgb, _, _, _ = wrist_cam.render()
-        top_rgb,   _, _, _ = top_cam.render()
 
-        ctx_rgb   = perturbation.apply_blackout(ctx_rgb,   "camera1")
-        wrist_rgb = perturbation.apply_blackout(wrist_rgb, "camera2")
-        top_rgb   = perturbation.apply_blackout(top_rgb,   "camera3")
+        ctx_rgb = None
+        if not perturbation.camera_is_absent("camera1"):
+            ctx_rgb, _, _, _ = context_cam.render()
+            ctx_rgb = perturbation.apply_blackout(ctx_rgb, "camera1")
+
+        wrist_rgb = None
+        if not perturbation.camera_is_absent("camera2"):
+            wrist_cam.move_to_attach()
+            wrist_rgb, _, _, _ = wrist_cam.render()
+            wrist_rgb = perturbation.apply_blackout(wrist_rgb, "camera2")
+
+        top_rgb = None
+        if not perturbation.camera_is_absent("camera3"):
+            top_rgb, _, _, _ = top_cam.render()
+            top_rgb = perturbation.apply_blackout(top_rgb, "camera3")
 
         for w_role, w_cam in witness_cams.items():
             if "wrist" in w_role:
@@ -373,13 +388,21 @@ def run_rollout(
                 wit_vid[w_role].append(w_rgb.copy())
 
         if step % RECORD_EVERY == 0:
-            train_vid["context"].append(ctx_rgb.copy())
-            train_vid["wrist"].append(wrist_rgb.copy())
-            train_vid["top"].append(top_rgb.copy())
+            if ctx_rgb is not None:
+                train_vid["context"].append(ctx_rgb.copy())
+            if wrist_rgb is not None:
+                train_vid["wrist"].append(wrist_rgb.copy())
+            if top_rgb is not None:
+                train_vid["top"].append(top_rgb.copy())
 
         qpos   = so101.get_dofs_position().cpu().numpy()
+
+        absent = {k for k in ["camera1","camera2","camera3"]
+          if perturbation.camera_is_absent(k)}
+        
         action = agent.act(ctx_rgb, wrist_rgb, top_rgb, qpos[:6],
-                           language_instruction=lang_instr)
+                   language_instruction=lang_instr,
+                   absent_cameras=absent)
 
         arm_target     = action[:5]
         gripper_target = np.array([action[5]])
@@ -435,12 +458,13 @@ def _save_episode_videos(r, tag, policy_video_dir, witness_video_dir, fps=15):
         (policy_video_dir / role).mkdir(parents=True, exist_ok=True)
         _write(train_vid[role], policy_video_dir / role / f"{tag}.mp4")
 
-    combined_policy = [
-        np.concatenate([c, w, t], axis=1)
-        for c, w, t in zip(train_vid["context"], train_vid["wrist"], train_vid["top"])
-    ]
-    (policy_video_dir / "combined").mkdir(parents=True, exist_ok=True)
-    _write(combined_policy, policy_video_dir / "combined" / f"{tag}.mp4")
+    present = [train_vid[r] for r in ("context", "wrist", "top") if train_vid[r]]
+    if len(present) > 1:
+        combined_policy = [
+            np.concatenate(frames, axis=1)
+            for frames in zip(*present)
+        ]
+        _write(combined_policy, policy_video_dir / "combined" / f"{tag}.mp4")
 
     for w_role in wit_vid:
         short = w_role.replace("witness_", "")
@@ -472,11 +496,10 @@ def main():
 
     # ── Camera perturbation ───────────────────────────────────────────────────
     parser.add_argument(
-        "--blackout_mode", default="none",
-        choices=["none", "3-cam", "3rd_black", "all_black",
-             "wrist_only", "context_only", "top_only",
-             "no_top", "no_wrist", "no_context"],
+    "--blackout_mode", default="none",
+    choices=list(BLACKOUT_MODES), 
     )
+
     parser.add_argument("--pos_target",  default=None,
                         choices=[None, "context", "wrist", "top"])
     parser.add_argument("--pos_offset",  nargs=3, type=float, default=[0.0, 0.0, 0.0],
