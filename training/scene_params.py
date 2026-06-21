@@ -314,7 +314,10 @@ BLACKOUT_MODES = {
     "wrist_only", "context_only", "top_only",   
     "no_top", "no_wrist", "no_context",
     "absent_wrist", "absent_context", "absent_top",
-    "absent_all",         
+    "absent_all", 
+    "absent_wrist_top",     
+    "absent_context_top",     
+    "absent_wrist_context",        
 }
 
 _CAM_ROLE = {"camera1": "context", "camera2": "wrist", "camera3": "top"}
@@ -323,8 +326,16 @@ def is_camera_absent(cam_key: str, mode: str) -> bool:
     role = _CAM_ROLE.get(cam_key)
     if mode == "absent_all":
         return True
-    return mode == f"absent_{role}"
-
+    if mode == f"absent_{role}":
+        return True
+    # Multi-absent modes: check if this role appears in the mode name
+    if mode == "absent_wrist_top":
+        return role in ("wrist", "top")
+    if mode == "absent_context_top":
+        return role in ("context", "top")
+    if mode == "absent_wrist_context":
+        return role in ("wrist", "context")
+    return False
 
 def apply_camera_blackout(
     frame: np.ndarray, cam_key: str, mode: str = "none"
